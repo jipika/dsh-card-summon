@@ -1,0 +1,577 @@
+/**
+ * 召唤注入：把一张角色卡翻译成 DSH 可执行的系统提示段。
+ *
+ * 三条硬规则（与 dsh-workbuddy-summon 同源，本机实测过）：
+ *  1) **未召唤 = 完全不注入**：求值器返回空串，宿主 renderPrompt 过滤空段，零残留。
+ *  2) **求值器只查表**：`text` 是函数，每个模型步都会被调用（本机实测 {agent, scope, signal}）。
+ *     里面绝不能有 fetch / 磁盘扫描 —— 否则每轮请求都付一次网络代价。卡在召唤那一刻抓完、
+ *     渲染成文本、写盘缓存；求值器只从内存 Map 读。
+ *  3) **必须截断**：Chub 卡的 personality 实测可达 7k+ 字符，scenario / example_dialogs
+ *     也不小，全量注入会挤爆上下文。超出上限就截断，并给出 card_read 的取回提示。
+ *
+ * 内容立场（这是本插件与"内容过滤型"工具的区别所在）：
+ *   召唤是用户在**自己的机器上、用自己选的数据源、对自己配的模型**做出的显式会话级意图。
+ *   角色的年龄、性别、取向、关系的尺度与边界由卡本身和用户用法决定 —— 这里不做二次审查、
+ *   不追加"保持得体"之类的软化提示、不因为卡带 NSFW 标签就改写它的措辞。注入的是原文。
+ *
+ *   唯一的例外不是过滤，而是**知情**：若卡自身的元数据（标签/文本）出现明显的未成年性化
+ *   指向，插件不删改内容，但会把这件事显式摆到用户面前要求确认（见 detectMinorFlag）。
+ *   判断权留给用户，插件既不替用户沉默过滤，也不替用户事后背书。
+ */
+
+import { applyMacrosToCard, resolveVarsFor } from "./vars.js";
+
+/** 注入段的名字（systemPrompt.section 的 name 字段）。 */
+export const SECTION_NAME = "dsh-card-summon:character";
+
+/**
+ * 装配权重。
+ *
+ * 避开官方 SECTION_ORDERS 里已占用的号：900 = FILE_REFERENCE、800 = PTC_ONLY、
+ * 1000+ 全是工具规范。取 700：压过通用默认人格（DEPLOYMENT_PERSONA_PREFIX=0），
+ * 但早于工具规范与权限纪律 —— 角色身份不该覆盖"怎么用工具""能不能读文件"这些纪律。
+ *
+ * ⚠️ 升级检查点：700 = TEAM_POLICY(600) 与 PTC_ONLY(800) 之间。若官方将来占用 700，
+ * 同序会退化为按 name 排序，本段位置会漂移 —— 升级 DSH 后回来确认一次。
+ */
+export const SECTION_ORDER = 700;
+
+/** 各字段的默认注入预算（字符）。超了截断并提示 card_read。 */
+export const BUDGET = {
+	personality: 12_000,
+	/**
+	 * 世界书提炼文本（personaDerived）的预算。
+	 *
+	 * **必须与 lib/local.js 的 maxBookPersona 默认值同量级**，否则会发生二次截断：
+	 * 实测一张 6 条常驻的卡在提炼层算出 12759 字符，却在这里被 12000 又硬切掉 759 字符 ——
+	 * 而作者把「主角本人」的条目放在 insertion_order=101（**末位**），切掉的正好是它的尾部，
+	 * 于是「人设补齐了」的修复在注入层被悄悄撤回，只留一个面目模糊的通用截断提示。
+	 * 这类「下游把上游的修复吃掉」的坑症状与本 BUG 完全相同，极难二分。
+	 */
+	personaDerived: 20_000,
+	scenario: 2_000,
+	exampleDialogs: 6_000,
+	systemPrompt: 4_000,
+	postHistoryInstructions: 2_000,
+	firstMessage: 3_000,
+};
+
+/* ─────────────────── 知情提示（不是过滤） ─────────────────── */
+
+/**
+ * 疑似未成年性化设定的元数据探测。
+ *
+ * 只读**卡自身的标签与作者写的简介**，不去语义分析角色文本（那既不可靠也越权）。
+ * 命中不等于判定为违规：年龄标注模糊、同人设定、年龄增长剧情都会误报。
+ * 所以这里只产出一个 flag，由 card_summon 要求用户显式确认后才继续 —— 内容一字不改。
+ */
+const MINOR_PATTERNS = [
+	/\b(?:shota|loli|pedo|paedo|underage|minor|child(?:ren)?|kid|teen(?:s)?)\b/i,
+	/\b(?:elementary|middle\s*school|high\s*school(?:er)?|preteen|pre-teen)\b/i,
+	/\bage[\s_-]*(?:play|regression)\b/i,
+	/(?:小学生|中学生|高中生|幼女|正太|萝莉|未成年|儿童)/,
+];
+
+export function detectMinorFlag(card) {
+	const haystack = [
+		...(Array.isArray(card?.tags) ? card.tags : []),
+		card?.description ?? "",
+		card?.creatorNotes ?? "",
+	]
+		.join(" \n ")
+		.slice(0, 4000); // 只看元数据头部，避免把长人设正文里的无关词扫进来
+	if (haystack.trim().length === 0) return { flagged: false };
+	const hits = [];
+	for (const re of MINOR_PATTERNS) {
+		const m = haystack.match(re);
+		if (m !== null) hits.push(m[0]);
+	}
+	if (hits.length === 0) return { flagged: false };
+	return {
+		flagged: true,
+		hits: [...new Set(hits)].slice(0, 6),
+		why:
+			`卡自身的标签/简介里出现了可能与未成年相关的字样：${[...new Set(hits)].join("、")}。` +
+			`这不构成判定（同人设定、年龄模糊、年龄增长剧情都会误报），插件不会因此改写或删减卡的任何内容。`,
+	};
+}
+
+/* ───────────────────────── 渲染 ───────────────────────── */
+
+/** 去掉卡里可能出现的前后空白与 BOM，避免注入段里出现怪字符。 */
+function clean(text) {
+	return String(text ?? "").replace(/^\uFEFF/, "").trim();
+}
+
+/** 按预算截断，返回 {text, truncated, original}。 */
+function clip(text, max) {
+	const body = clean(text);
+	if (body.length <= max) return { text: body, truncated: false, original: body.length };
+	return {
+		text: `${body.slice(0, max)}\n（…此处截断，原文共 ${body.length} 字符。需要完整内容请调用 card_read）`,
+		truncated: true,
+		original: body.length,
+	};
+}
+
+/** 一行摘要，用于"替代问候"这类列表。 */
+function oneLine(text, max) {
+	const flat = clean(text).replace(/\s+/g, " ");
+	return flat.length <= max ? flat : `${flat.slice(0, max)}…`;
+}
+
+/**
+ * 注入前的宏求值（P0 · 酒馆对齐）。
+ *
+ * 为什么放在**一个入口**、而不是各字段各调一次：
+ *  ① 顺序是硬约束 —— 必须在 `clip()` 之前。clip 是无脑 `slice()`，先截断会把
+ *     `{{user}}` 切成 `{{us`，替换器再也认不出它，残片就永久留在注入段里。
+ *  ② 逐字段替换**必然漏字段**：personaDerived 是从世界书现算的派生值，
+ *     写这段注释时就差点把它漏掉；改成整卡进出后这种漏法在结构上不可能发生。
+ *  ③ 只换注入面 —— 返回浅拷贝。调用方随后落盘的卡文件（card_read 要取回的**原文**）
+ *     与详情面板看的仍是作者原样，不被我们的求值污染。
+ *
+ * 变量表：卡级 > 全局 > 默认（lib/vars.js 的 resolveVarsFor）。首次调用读一次
+ * vars.json，之后走内存缓存 —— 本函数在**召唤那一刻**调用，不在求值器里，
+ * 所以不违反"求值器禁止 IO"这条铁律。
+ *
+ * @param {object} card normalizeCard 的结果（或任何卡形对象）
+ * @param {{userName?: string, charName?: string}} [opts]
+ * @returns {{card: object, report: object}} card 是浅拷贝，report 见 vars.js
+ */
+function renderMacros(card, opts = {}) {
+	const vars = resolveVarsFor(card, { userName: opts?.userName, charName: opts?.charName });
+	return applyMacrosToCard(card, {
+		vars,
+		userName: vars.user,
+		charName: vars.char,
+	});
+}
+
+/**
+ * 渲染注入段。
+ * @param {object} card  normalizeCard 的结果
+ * @param {{maxPersonality?: number}} [opts]
+ * @returns {{text: string, truncatedFields: string[], chars: number}} text 为空串表示不注入
+ */
+export function composeSummon(input, opts = {}) {
+	if (input === undefined || input === null) return { text: "", truncatedFields: [], chars: 0 };
+	// 宏先把原文求值成真实文本；下面所有预算/截断/拼装都按**求值后**的长度判定 ——
+	// 长用户名/长卡名会让替换后的文本变长，按替换前算会悄悄突破 BUDGET。
+	const { card, report: macroReport } = renderMacros(input, opts);
+	const name = clean(card.name);
+	if (name.length === 0) return { text: "", truncatedFields: [], chars: 0 };
+
+	const personalityMax = Number.isFinite(opts.maxPersonality) ? opts.maxPersonality : BUDGET.personality;
+	const parts = [];
+	const truncatedFields = [];
+
+	// ── 头部：身份声明 ──
+	parts.push(`# 本会话已召唤角色卡：${name}`);
+	parts.push("");
+	parts.push(
+		`用户在本会话里召唤了这个角色。从现在起，你**就是${name}**——` +
+			`以下面这份角色定义为你的人格、说话方式与行为依据，它优先于通用助手人格。` +
+			`不要用"作为 AI 助手"之类的口吻跳出角色；不要复述这份定义，直接以角色身份说话。`,
+	);
+	parts.push("");
+	if (card.fullPath) {
+		parts.push(
+			`> 卡来源：Chub \`${card.fullPath}\`${card.rating !== undefined && card.rating !== null ? `（rating ${card.rating}）` : ""}`,
+		);
+		parts.push("");
+	}
+
+	// ── 人设主体 ──
+	// 兜底：本地卡实测 48.4% 的 personaLen=0（内容在世界书的常驻条目里）。
+	// 这类卡由 lib/local.js 提炼出 personaDerived，personality 为空时回退到它，
+	// 否则会很突兀地注入一句「这张卡没有给出 personality」。
+	const derived = clean(card.personaDerived);
+	const useDerived = clean(card.personality).length === 0 && derived.length > 0;
+	const personality = clip(
+		useDerived ? derived : card.personality,
+		// derived 走世界书提炼（量级由 maxBookPersona 决定），这里用专门的预算兜底，
+		// 否则会被 personality 的小预算二次截断（详见 BUDGET.personaDerived 注释）。
+		useDerived ? Math.max(personalityMax, BUDGET.personaDerived) : personalityMax,
+	);
+	if (personality.text.length > 0) {
+		parts.push(
+			`## 角色定义${personality.truncated ? "（节选）" : ""}` +
+				(useDerived ? "（人设字段为空，以下摘自卡内世界书的常驻条目）" : ""),
+		);
+		parts.push("");
+		parts.push(personality.text);
+		parts.push("");
+		parts.push(`- 你（角色名）：${name}`);
+		parts.push("");
+		// 世界书常驻条目被预算丢掉的必须显式说出来：否则模型会以为「这就是全部设定」，
+		// 按缺失的人设自由发挥 —— 实测这正是「角色演偏」的根因。
+		const dropped = Array.isArray(card.personaDerivedDropped) ? card.personaDerivedDropped : [];
+		if (useDerived && dropped.length > 0) {
+			const list = dropped.map((d) => `${d.label}（约 ${d.chars} 字）`).join("、");
+			parts.push(
+				`> ⚠️ 卡内另有 ${dropped.length} 条**常驻**设定因注入预算未纳入：${list}。` +
+					`它们被作者标记为「总是要放进上下文」—— 涉及相关设定时请调用 card_read 取回，不要自行编造。`,
+			);
+			parts.push("");
+			truncatedFields.push(`personaDerived.dropped(${dropped.length})`);
+		}
+		if (personality.truncated) truncatedFields.push(useDerived ? "personaDerived" : "personality");
+	} else {
+		// 拿不到人设时不假装成功：明确告知，避免模型凭空编人设
+		parts.push(`## 角色定义`);
+		parts.push("");
+		parts.push(
+			`> ⚠️ 这张卡没有给出 personality 字段（或抓取时为空）。` +
+				`请先调用 card_read 取回完整卡定义；取不到就如实告诉用户，不要凭名字虚构人设。`,
+		);
+		parts.push("");
+	}
+
+	// ── 场景 ──
+	const scenario = clip(card.scenario, BUDGET.scenario);
+	if (scenario.text.length > 0) {
+		parts.push(`## 场景`);
+		parts.push("");
+		parts.push(scenario.text);
+		parts.push("");
+		if (scenario.truncated) truncatedFields.push("scenario");
+	}
+
+	// ── 开场白 ──
+	const first = clip(card.firstMessage, BUDGET.firstMessage);
+	if (first.text.length > 0) {
+		parts.push(`## 开场白（角色的第一句话，供你把握语气与情境；不必逐字重发）`);
+		parts.push("");
+		parts.push(first.text);
+		parts.push("");
+		if (first.truncated) truncatedFields.push("first_message");
+	}
+
+	// ── 对话示例：学说话方式最有效的一段，别省 ──
+	const examples = clip(card.exampleDialogs, BUDGET.exampleDialogs);
+	if (examples.text.length > 0) {
+		parts.push(`## 对话示例（照这里的语气与句式说话）`);
+		parts.push("");
+		parts.push(examples.text);
+		parts.push("");
+		if (examples.truncated) truncatedFields.push("example_dialogs");
+	}
+
+	// ── 作者附带的系统提示 / 后续指令：原文并入 ──
+	const sysPrompt = clip(card.systemPrompt, BUDGET.systemPrompt);
+	if (sysPrompt.text.length > 0) {
+		parts.push(`## 作者附加指令`);
+		parts.push("");
+		parts.push(sysPrompt.text);
+		parts.push("");
+		if (sysPrompt.truncated) truncatedFields.push("system_prompt");
+	}
+	const post = clip(card.postHistoryInstructions, BUDGET.postHistoryInstructions);
+	if (post.text.length > 0) {
+		parts.push(`## 持续生效的指令`);
+		parts.push("");
+		parts.push(post.text);
+		parts.push("");
+		if (post.truncated) truncatedFields.push("post_history_instructions");
+	}
+
+	// ── 替代开场白：只列摘要，需要时用工具取 ──
+	const alts = Array.isArray(card.alternateGreetings) ? card.alternateGreetings : [];
+	if (alts.length > 0) {
+		parts.push(`## 替代开场白（共 ${alts.length} 条，仅列摘要）`);
+		parts.push("");
+		alts.slice(0, 8).forEach((g, i) => {
+			parts.push(`${i + 1}. ${oneLine(g, 120)}`);
+		});
+		if (alts.length > 8) parts.push(`… 其余 ${alts.length - 8} 条见 card_read`);
+		parts.push("");
+	}
+
+	// ── 世界书：有就说明怎么用，正文不注入 ──
+	if (card.lorebook !== null && card.lorebook !== undefined) {
+		parts.push(
+			`> 这张卡内嵌了世界书（lorebook）。正文未注入；当对话涉及设定细节而你不确定时，` +
+				`调用 card_read 取回，不要自行编造设定。`,
+		);
+		parts.push("");
+	}
+
+	// ── 未赋值的自定义变量：明说，别让模型自由发挥 ──
+	// 卡里的 {{好感度}} 这类作者自定义宏没有值可代（酒馆里由扩展在运行期填）。
+	// lib/vars.js 的三分策略把它们**原样保留** —— 但注入段里留一个裸的 {{好感度}}
+	// 会让模型以为那是它该输出的东西。这里显式说明，并把取值权交回用户。
+	const missingMacros = Array.isArray(macroReport?.missing) ? macroReport.missing : [];
+	if (missingMacros.length > 0) {
+		const list = missingMacros.map((m) => `\`{{${m.name}}}\``).join("、");
+		parts.push(
+			`> 卡里出现了未赋值的自定义变量：${list}。` +
+				`它们按原文保留，含义由卡的上下文决定；需要具体取值而用户没有说明时，先问用户，不要自行假定。` +
+				`用户可在角色卡面板的「变量」页为它们赋值。`,
+		);
+		parts.push("");
+	}
+
+	// ── 收尾：退出方式 ──
+	parts.push(`> 用户取消召唤后，该身份立即失效。与角色无关的通用安全边界与工具纪律仍然有效。`);
+
+	const text = parts.join("\n").trim();
+	return { text, truncatedFields, chars: text.length, macroReport };
+}
+
+/**
+ * 阵容（cast）注入段：一次带入多个角色，由**你**（同一个模型）分别扮演。
+ *
+ * 与 composeSummon 的区别：composeSummon 是「我就是这个角色」（接管人格，用于沉浸单聊）；
+ * composeCast 是「我主持这场戏，同时演这些人」（不接管人格，用于开团/群像/写文）。
+ * 两者的注入契约一致（都返回 {text, truncatedFields, chars}），走同一个 section。
+ *
+ * 每人的人设按预算分别截断 —— 4 人团各自 3000 字比「第一个人 12000 字」实用。
+ */
+/* ───────────────── 动态世界书（keys 关键词触发 · 每轮求值） ───────────────── */
+
+/**
+ * 动态世界书的字符预算。与静态人设的 BUDGET 分开算：
+ * 静态段是「一召唤就定死」的身世，这一段是「对话里提到了才浮出来」的补充设定，
+ * 两者挤同一个额度只会让长卡更容易被裁掉。
+ */
+export const DYNAMIC_LORE_BUDGET = 4000;
+
+/** 回头看多少字符的对话来找关键词。 */
+export const DYNAMIC_SCAN_DEPTH = 4000;
+
+/**
+ * 从一张卡里挑出「可被关键词触发」的世界书条目，返回一张**只带世界书的卡影子**。
+ *
+ * 为什么不在求值器里直接从卡上读：求值器每轮都会跑，而且**不能做任何 IO**
+ * （卡对象要么在盘上 cards/<id>.json 里，要么需要重新抓取）。所以候选条目在
+ * 召唤那一刻就提取好、连正文一起挂在内存的 sections 记录上，求值器只做字符串匹配。
+ *
+ * 只收三种条目：有 keys 的、非 constant 的、正文非空的。
+ * constant 条目已经在 personaFromBook 提炼的静态人设里了，再收一次会重复注入。
+ *
+ * @param {object} card 归一化后的卡
+ * @returns {{lorebook: {entries: Array<{keys: string[], content: string}>}} | undefined}
+ */
+export function dynamicSourceOf(card) {
+	const entries = [];
+	for (const entry of card?.lorebook?.entries ?? []) {
+		if (entry?.enabled === false) continue;
+		if (entry?.constant === true) continue;
+		const keys = (Array.isArray(entry?.keys) ? entry.keys : []).filter((k) => typeof k === "string" && k.length > 0);
+		if (keys.length === 0) continue;
+		const content = String(entry?.content ?? "").trim();
+		if (content.length === 0) continue;
+		entries.push({ keys, content });
+	}
+	return entries.length > 0 ? { lorebook: { entries } } : undefined;
+}
+
+/**
+ * 把多张卡的候选条目合并成一份（阵容注入用）。keys 去重不做：不同卡的同一个 key
+ * 命中不同设定是正常的，酒馆里也是各条目独立。
+ *
+ * @param {object[]} cards
+ * @returns {{lorebook: {entries: Array<{keys: string[], content: string}>}} | undefined}
+ */
+export function mergeDynamicSources(cards) {
+	const all = cards.map((card) => dynamicSourceOf(card)).filter((source) => source !== undefined);
+	if (all.length === 0) return undefined;
+	return { lorebook: { entries: all.flatMap((source) => source.lorebook.entries) } };
+}
+
+/**
+ * 拿最近的对话文本去撞世界书 keys，把命中的条目原文拼成一段。
+ *
+ * 三条纪律：
+ *   · **整条进出，不切句** —— 半句话的设定比没有更坏（同 personaFromBook）；
+ *   · 预算不够时跳过这一条继续看后面的**短条目**（不是 break）；
+ *   · 一条都没命中就返回空串 —— 宿主 renderPrompt 会 filter 掉空段，等于零影响。
+ *
+ * @param {object} source dynamicSourceOf() 的返回值
+ * @param {string} recentText 最近的对话文本
+ * @param {{budget?: number}} [opts]
+ * @returns {{text: string, hits: Array<{matched: string, chars: number}>}}
+ */
+export function composeDynamicLore(source, recentText, opts = {}) {
+	const budget = opts.budget ?? DYNAMIC_LORE_BUDGET;
+	const text = typeof recentText === "string" ? recentText : "";
+	if (text.length === 0) return { text: "", hits: [] };
+	const bodies = [];
+	const hits = [];
+	let used = 0;
+	for (const entry of source?.lorebook?.entries ?? []) {
+		const matched = entry.keys.find((key) => text.includes(key));
+		if (matched === undefined) continue;
+		if (used + entry.content.length > budget) continue;
+		bodies.push(entry.content);
+		hits.push({ matched, chars: entry.content.length });
+		used += entry.content.length;
+	}
+	if (bodies.length === 0) return { text: "", hits: [] };
+	return { text: `【本轮对话触发的世界书】\n${bodies.join("\n\n")}`, hits };
+}
+
+/**
+ * 最近一段对话的纯文本（给动态世界书撞 keys 用）。
+ *
+ * 只取末尾 maxMessages 条、再截到 scanDepth 字符：世界书的 keys 都是人名/地名/物品名这种
+ * 短词，盯住眼前这几轮就够，没必要把整条历史拼一遍（长会话里那是 O(n) 的字符串拷贝）。
+ *
+ * `session.deriveMessages()` 是官方公开入口（实验包 claude-code-mods 的 session.messages
+ * 工具就走它），内部对已折叠的事件有增量缓存，所以每轮开销只跟新消息数有关。
+ */
+export function recentTextOf(context, scanDepth, maxMessages = 40) {
+	const session = context?.agent?.session;
+	if (session === undefined || typeof session.deriveMessages !== "function") return "";
+	let messages;
+	try {
+		messages = session.deriveMessages();
+	} catch {
+		return "";
+	}
+	const parts = [];
+	let total = 0;
+	const floor = Math.max(0, messages.length - maxMessages);
+	for (let i = messages.length - 1; i >= floor; i -= 1) {
+		const text = messageTextOf(messages[i]);
+		if (text.length === 0) continue;
+		parts.push(text);
+		total += text.length;
+		if (total >= scanDepth) break;
+	}
+	parts.reverse();
+	const joined = parts.join("\n");
+	return joined.length > scanDepth ? joined.slice(-scanDepth) : joined;
+}
+
+/** 一条消息里的文本块（reasoning / tool_use / 图片等块一律不算）。 */
+export function messageTextOf(message) {
+	if (typeof message?.content === "string") return message.content;
+	const blocks = Array.isArray(message?.content) ? message.content : [];
+	const out = [];
+	for (const block of blocks) {
+		if (block?.type === "text" && typeof block.text === "string") out.push(block.text);
+	}
+	return out.join("\n");
+}
+
+export function composeCast(input, opts = {}) {
+	// 与 composeSummon 同一条纪律：宏在 clip 之前求值，且**逐人按各自的变量表**算
+	// （同一场戏里每张卡可以有不同的 {{user}} 配置，别用一个人的表套全团）。
+	const list = (Array.isArray(input) ? input : [])
+		.filter((c) => c?.card !== undefined && c.card !== null)
+		.map((c) => ({ ...c, card: renderMacros(c.card, opts).card }));
+	if (list.length === 0) return { text: "", truncatedFields: [], chars: 0, cast: [] };
+	const perPersona = Number.isFinite(opts.maxPersonalityPerRole) ? opts.maxPersonalityPerRole : 3_000;
+
+	const parts = [];
+	const truncatedFields = [];
+	const names = [];
+
+	parts.push(`# 本会话已组建阵容（共 ${list.length} 人）：由你同时扮演`);
+	parts.push("");
+	parts.push(
+		`用户让你主持这场多角色互动（开团 / 群像 / 写文）。你要**同时扮演**下列全部角色，` +
+			`每人按各自的人设说话与行动。用清楚的角色标识区分发言（如 \`【角色名】\` 开头），` +
+			`不要让角色之间说话方式混同；不确定某角色的细节时调用 card_read 取该卡原文，不要自行编造。`,
+	);
+	parts.push("");
+	parts.push(`> 你不是其中任何一个角色 —— 你是这些角色的共同扮演者与这场戏的主持人。`);
+	parts.push("");
+
+	// 目录：先让模型知道有谁
+	parts.push(`## 阵容名单`);
+	parts.push("");
+	parts.push("| 角色 | 卡路径 | 一句话 |");
+	parts.push("|---|---|---|");
+	for (const { card, role } of list) {
+		const nm = clean(card.name) || "(未命名)";
+		names.push(nm);
+		parts.push(`| **${nm}**${role ? `（${clean(role)}）` : ""} | \`${card.fullPath}\` | ${oneLine(card.description, 80)} |`);
+	}
+	parts.push("");
+
+	// 逐人给设定
+	list.forEach(({ card, role }, idx) => {
+		const nm = clean(card.name) || `角色${idx + 1}`;
+		parts.push(`## ${idx + 1}. ${nm}${role ? `（${clean(role)}）` : ""}`);
+		parts.push("");
+		// 同 composeSummon：人设字段为空时回退到世界书常驻条目提炼的文本
+		const derivedOne = clean(card.personaDerived);
+		const useDerivedOne = clean(card.personality).length === 0 && derivedOne.length > 0;
+		const personality = clip(useDerivedOne ? derivedOne : card.personality, perPersona);
+		if (personality.text.length > 0) {
+			if (useDerivedOne) {
+				parts.push(`（人设字段为空，以下摘自该卡世界书的常驻条目）`);
+				parts.push("");
+			}
+			parts.push(personality.text);
+			if (personality.truncated) truncatedFields.push(`${nm}.${useDerivedOne ? "personaDerived" : "personality"}`);
+			parts.push("");
+		} else {
+			parts.push(`> ⚠️ 此人设字段为空，请先 card_read({fullPath:"${card.fullPath}"}) 取回；取不到就如实说，不要凭空编。`);
+			parts.push("");
+		}
+		const scenario = clip(card.scenario, 600);
+		if (scenario.text.length > 0) {
+			parts.push(`场景：${scenario.text}`);
+			parts.push("");
+		}
+		const first = clip(card.firstMessage, 800);
+		if (first.text.length > 0) {
+			parts.push(`开场白（供把握语气，不必逐字重发）：`);
+			parts.push("");
+			parts.push(first.text);
+			parts.push("");
+		}
+		const sysP = clip(card.systemPrompt, 1_200);
+		if (sysP.text.length > 0) {
+			parts.push(`该作者附加指令：`);
+			parts.push("");
+			parts.push(sysP.text);
+			parts.push("");
+		}
+	});
+
+	parts.push(
+		`> 阵容由 card_cast 组建，可用 card_unsummon 或用户指令解除。` +
+			`与角色扮演无关的通用安全边界与工具纪律仍然有效。`,
+	);
+
+	const text = parts.join("\n").trim();
+	return { text, truncatedFields, chars: text.length, cast: names };
+}
+
+/**
+ * 侧边面板/工具用的卡摘要视图。
+ */
+export function cardView(card) {
+	return {
+		fullPath: card.fullPath,
+		name: card.name,
+		creator: card.creator,
+		slug: card.slug,
+		tagline: oneLine(card.description, 200),
+		tags: card.tags,
+		rating: card.rating,
+		nsfwImage: card.nsfwImage === true,
+		avatarUrl: card.avatarUrl,
+		cardPngUrl: card.cardPngUrl,
+		stats: card.stats,
+		has: {
+			personality: clean(card.personality).length > 0,
+			scenario: clean(card.scenario).length > 0,
+			firstMessage: clean(card.firstMessage).length > 0,
+			exampleDialogs: clean(card.exampleDialogs).length > 0,
+			alternateGreetings: (card.alternateGreetings ?? []).length,
+			lorebook: card.lorebook !== null && card.lorebook !== undefined,
+		},
+		sizes: {
+			personality: clean(card.personality).length,
+			scenario: clean(card.scenario).length,
+			exampleDialogs: clean(card.exampleDialogs).length,
+			firstMessage: clean(card.firstMessage).length,
+		},
+	};
+}

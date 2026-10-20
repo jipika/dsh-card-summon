@@ -1,0 +1,38 @@
+{
+  "name": "dsh-card-summon",
+  "icon": "./assets/icon.svg",
+  "version": "0.4.1",
+  "private": true,
+  "type": "module",
+  "description": "从 Chub 搜索并召唤 AI 角色卡，按需注入角色人格；未召唤时完全不干预会话。",
+  "license": "MIT",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true
+    }
+  },
+  "meta": {
+    "title": "角色卡召唤",
+    "description": "搜索 Chub 角色卡，一键召唤进当前会话，以该角色身份对话。"
+  },
+  "files": [
+    "index.js",
+    "lib/",
+    "locale/",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  }
+}
