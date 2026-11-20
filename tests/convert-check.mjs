@@ -5,8 +5,8 @@
  * 这样模型看不到可照抄的 `<StatusBar>` 模板，就不会输出 DSH 渲染不了的标签。
  *
  * 本测试锁死：
- *   ① 状态栏模板块 → Markdown 引用块（字段名加粗、嵌套字段与两条 "无" 不丢）；
- *   ② 含 <StatusBar> 的指令行 → 「用 Markdown 引用块输出」，不残留 ```
+ *   ① 状态栏模板块 → Markdown 嵌套列表（字段名加粗、嵌套字段与两条 "无" 不丢）；
+ *   ② 删除仅描述 <StatusBar> 包装的指令，不添加格式提示词；
  *   ③ `<user>` / `{{<user>}}` → `{{user}}`，不产生 `{{{{user}}}}`；
  *   ④ `<br>` 转换、`<b>` → `**`、`</text>`/`<center>` 去掉、`<START>` 保留；
  *   ⑤ composeSlots / composeCast 全槽位无自造标签残留，且 auto 下不注入格式规则；
@@ -45,20 +45,20 @@ Status_Bar:
 </StatusBar>
 \`\`\``;
 
-console.log("=== 1) 单元：状态栏块 → 引用块 ===");
+console.log("=== 1) 单元：状态栏块 → 嵌套列表 ===");
 const converted = markdownizeText(statusBlock);
 t("不再含 <StatusBar>", !converted.includes("<StatusBar>"));
 t("不再含孤立 ```", !converted.includes("```"));
-t("变成引用块", converted.includes("> **Status_Bar**:"));
-t("字段名加粗", converted.includes("**Date_and_Time**"));
-t("嵌套 User_List 保留", converted.includes("**User_List**"));
-t("Recent_Sexual_Activity 两条 \"无\" 都在", (converted.match(/- "无"/g) || []).length === 2);
+t("变成嵌套列表", converted.includes("**状态栏**"));
+t("字段名加粗", converted.includes("- **时间**:"));
+t("嵌套 User_List 保留", converted.includes("- **人物**:"));
+t("Recent_Sexual_Activity 两条 \"无\" 都在", (converted.match(/- 无/g) || []).length === 2);
 t("{{<user>}} 变成 {{user}}", converted.includes("{{user}}") && !converted.includes("{{<user>}}"));
 t("没有 {{{{user}}}} 嵌套", !converted.includes("{{{{"));
 
 console.log("\n=== 2) 单元：指令行与常见标签 ===");
 const directive = markdownizeText("- 外层必须用<StatusBar></StatusBar>再用代码块(```)包裹");
-t("指令行改成 Markdown 说明", directive.includes("用 Markdown 引用块输出"));
+t("删除旧包装指令且不添加格式提示词", directive === "");
 t("指令行不残留标签", !/<StatusBar>/i.test(directive));
 t("<br> → 换行", markdownizeText("甲<br>乙") === "甲\n乙");
 t("<b> → **", markdownizeText("<b>重点</b>") === "**重点**");
@@ -86,7 +86,7 @@ t("所有槽位无 <StatusBar>", !/<StatusBar>/i.test(slotText));
 t("所有槽位无 </text> / <center>", !/<center>|<\/text>/i.test(slotText));
 t("只允许 <START> 残留", (slotText.match(TAG_RE) || []).every((x) => x === "<START>"), `实得 ${JSON.stringify(slotText.match(TAG_RE))}`);
 t("persona 槽保留正文", composed.slots.persona.includes("脸红了"));
-t("greeting 槽是引用块", composed.slots.greeting.includes("> **Status_Bar**:"));
+t("greeting 槽是嵌套列表", composed.slots.greeting.includes("**状态栏**"));
 t("世界书条目被转换（<b> → **）", slotText.includes("**重点**"));
 t("格式提示词已移除：slots 里没有 format 槽", !("format" in composed.slots));
 
@@ -94,7 +94,7 @@ console.log("\n=== 4) 卡级：composeCast ===");
 const cast = composeCast([{ card: { ...card, fullPath: "probe/convert" } }]);
 t("cast 无 <StatusBar>", !/<StatusBar>/i.test(cast.text));
 t("cast 无 <center>", !cast.text.includes("<center>"));
-t("cast 保留引用块", cast.text.includes("> **Status_Bar**:"));
+t("cast 保留嵌套列表", cast.text.includes("**状态栏**"));
 
 console.log("\n=== 5) markdownizeCard 不改原卡 ===");
 const before = JSON.stringify(card);

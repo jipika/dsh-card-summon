@@ -240,17 +240,55 @@ const moduleExports = { exports: {} };
 const requireStub = (n) => {
 	if (n === "react") return ReactStub;
 	if (n === "react-dom") return { createPortal: (el) => el };
+	// 官方 Switch 原语：client.js 现在裸 require 它（面板开关用它，不再手搓）。
+	// 桩只要形状对即可，断言不依赖其内部实现。
+	if (n === "@deepseek-ai/dsh-client-ui-primitives") {
+		return {
+			Switch: (p) =>
+				ReactStub.createElement(
+					"button",
+					{
+						type: "button",
+						role: "switch",
+						"aria-checked": p.checked,
+						"aria-label": p.label,
+						title: p.title,
+						disabled: p.disabled === true,
+						onClick: () => p.onChange(!p.checked),
+					},
+					ReactStub.createElement("span", null),
+				),
+		};
+	}
 	throw new Error(`未预期的 require: ${n}`);
 };
 const loaded = registered.factory(requireStub);
 t("exports.name 正确", loaded.name === "dsh-card-summon");
-t("exports.inject = [slots, locale]", JSON.stringify(loaded.inject) === '["slots","locale"]');
+t("exports.inject 含 slots/locale/sessions（填入输入框要走 sessions.scope）", JSON.stringify(loaded.inject) === '["slots","locale","sessions"]');
 t("exports.apply 是函数", typeof loaded.apply === "function");
 
 // 抓 Slot 注册（两个槽位：conversation.input.right 宿主 + dsh-toolbox.menu 菜单行）
 const slotEntries = new Map();
 const slotComps = new Map();
+const draftCalls = [];
 const ctx = {
+	sessions: {
+		scope: (sid) => ({
+			get: (name) => {
+				if (name !== "conversation") return undefined;
+				return {
+					input: {
+						for: () => ({
+							setDraft: (text) => {
+								draftCalls.push({ sid, text });
+							},
+							focus: () => {},
+						}),
+					},
+				};
+			},
+		}),
+	},
 	effect(fn) {
 		const d = fn();
 		return typeof d === "function" ? d : () => {};
@@ -286,6 +324,11 @@ t("slot 注册成功（input.right + toolbox.menu）", slotEntries.has("conversa
 const hostComp = slotComps.get("conversation.input.right");
 const rowComp = slotComps.get("dsh-toolbox.menu");
 t("组件已拿到", typeof hostComp === "function" && typeof rowComp === "function");
+const hostEntry = slotEntries.get("conversation.input.right");
+const hostProps = typeof hostEntry?.inject === "function" ? hostEntry.inject() : {};
+t("宿主 slot 透出 fillDraft（开场白填入输入框用）", typeof hostProps.fillDraft === "function");
+t("fillDraft 空文本拒绝（不污染输入框）", hostProps.fillDraft("sess-1", "") === false && draftCalls.length === 0);
+t("fillDraft 走 sessions.scope → conversation.input.setDraft", hostProps.fillDraft("sess-1", "你好") === true && draftCalls.length === 1 && draftCalls[0].text === "你好");
 
 /* ─────────────── 驱动组件，观察真实 fetch ─────────────── */
 /** 词典函数：与宿主 inject() 注入的 t 同形。 */

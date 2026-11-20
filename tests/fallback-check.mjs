@@ -62,7 +62,7 @@ const makeCtx = () => ({
 		return typeof d === "function" ? d : () => {};
 	},
 	on: () => () => {},
-	systemPrompt: { section: () => () => {} },
+	systemPrompt: { context: () => () => {}, section: () => () => {} },
 	tools: {
 		register: (d) => {
 			calls.tools[d.name] = d;

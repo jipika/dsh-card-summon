@@ -247,7 +247,7 @@ const ctx = {
 		return typeof d === "function" ? d : () => {};
 	},
 	on: () => () => {},
-	systemPrompt: { section: () => () => {} },
+	systemPrompt: { context: () => () => {}, section: () => () => {} },
 	tools: { register: () => () => {} },
 	webServer: {
 		register(def) {

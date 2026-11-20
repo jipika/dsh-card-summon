@@ -4,7 +4,7 @@
 #
 # name 必须是 package.json 里的完整包名（本包非 scoped，就是 dsh-card-summon）。
 # config 字段：
-#   maxPersonality   注入段里角色定义正文的字符上限（默认 12000，超出截断并给出 card_read 提示）
+#   maxPersonality   注入段里角色定义正文的字符上限（默认 12000，超出截断并在 note 里指向 card_inject_more）
 #   remoteRepo       远程卡库仓库（owner/repo）。配了即启用远程，**默认优先走远程**。
 #                    token 优先取 remoteToken，否则回退 `gh auth token`（本机已登录即可用）。
 #   localRoot        本地角色卡库根目录（PNG 卡库）。远程不可达时降级用；留空则不用本地。
@@ -15,6 +15,8 @@
 #   fictionFrame     默认 true：每次召唤自动注入「虚构框架」段 —— 所有角色由成年人扮演的
 #                    虚构人物；卡或剧情出现初高中生/校园年龄标注时按虚构角色照常扮演。
 #                    写 false 关闭。段在 phi 之后、写作规范之前读。
+#                    **面板顶部的「虚构声明」开关优先级高于这里** —— 运行时值落盘在
+#                    ~/.dsh/card-summon/settings.json，面板点过之后本项不再影响结果。
 #   fictionFrameText 可选：自定义文本整段替换默认框架（1200 字符预算）。
 - insert:
     - id: card-summon

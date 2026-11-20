@@ -24,7 +24,7 @@ const calls = { tools: [], routes: [] };
 const ctx = {
 	effect: (f) => { const d = f(); return typeof d === "function" ? d : () => {}; },
 	on: () => () => {},
-	systemPrompt: { section: () => () => {} },
+	systemPrompt: { context: () => () => {}, section: () => () => {} },
 	tools: { register: (d) => { calls.tools.push(d); return () => {}; } },
 	webServer: { register: (d) => { calls.routes.push(d); return () => {}; } },
 	agents: { currentInitiator: () => ({ sessionId: "cast-probe", session: { header: { id: "cast-probe" } } }) },

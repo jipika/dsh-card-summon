@@ -15,7 +15,7 @@ const LIB = "/Volumes/mac/下载/26.6角色卡/26.7月全中文备注角色卡�
 const calls = { routes: [], tools: {} };
 const ctx = {
   effect: (f) => { const d = f(); return typeof d === "function" ? d : () => {}; },
-  on: () => () => {}, systemPrompt: { section: () => () => {} },
+  on: () => () => {}, systemPrompt: { context: () => () => {}, section: () => () => {} },
   tools: { register: (d) => { calls.tools[d.name] = d; return () => {}; } },
   webServer: { register: (d) => { calls.routes.push(d); return () => {}; } },
   agents: { currentInitiator: () => ({ sessionId: "cc", session: { header: { id: "cc" } } }) },

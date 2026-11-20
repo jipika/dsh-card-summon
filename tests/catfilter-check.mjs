@@ -12,7 +12,7 @@ const ROOT = new URL("..", import.meta.url).pathname.replace(/\/$/, "");
 const calls = { routes: [] };
 const ctx = {
   effect: (f) => { const d = f(); return typeof d === "function" ? d : () => {}; },
-  on: () => () => {}, systemPrompt: { section: () => () => {} },
+  on: () => () => {}, systemPrompt: { context: () => () => {}, section: () => () => {} },
   tools: { register: () => () => {} },
   webServer: { register: (d) => { calls.routes.push(d); return () => {}; } },
   agents: { currentInitiator: () => ({ sessionId: "c", session: { header: { id: "c" } } }) },

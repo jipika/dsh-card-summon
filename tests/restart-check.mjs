@@ -95,7 +95,7 @@ async function call(routes, method, url, body) {
 
 /** 跑一次 apply（= 模拟一次进程启动）。 */
 async function boot() {
-	const calls = { sections: [], tools: [], routes: [] };
+	const calls = { sections: [], contexts: [], tools: [], routes: [] };
 	const ctx = {
 		effect(fn) {
 			const d = fn();
@@ -107,6 +107,10 @@ async function boot() {
 		systemPrompt: {
 			section(def) {
 				calls.sections.push(def);
+				return () => {};
+			},
+			context(def) {
+				calls.contexts.push(def);
 				return () => {};
 			},
 		},
@@ -153,6 +157,18 @@ function evalAll(calls, recentText) {
 		.join("\n\n");
 }
 
+/** 动态 context 求值（user 角色那条）。静态 section 里不再含动态命中。 */
+function evalDyn(calls, recentText) {
+	if (calls.contexts.length === 0) return "";
+	const ctx = evalCtx(recentText);
+	return calls.contexts
+		.slice()
+		.sort((a, b) => a.order - b.order)
+		.map((c) => c.text(ctx))
+		.filter((x) => x.length > 0)
+		.join("\n\n");
+}
+
 console.log("=== 1) 造出「上一次运行留下的盘上状态」===");
 // chars 故意写一个离谱值：模拟「上次召唤时落盘的字符数」与「重启后按新代码重算的字符数」不一致。
 setSummon(SESSION, { fullPath: CARD.fullPath, name: CARD.name, chars: 999_999, at: new Date().toISOString() });
@@ -164,6 +180,12 @@ t("sections/<id>.md 已落盘", loadSectionFromDisk(SESSION) === STATIC_TEXT);
 console.log("\n=== 2) 模拟重启：apply() 必须把静态段 + 动态候选一起恢复 ===");
 const first = await boot();
 t(`apply 注册了 ${mod.SLOTS.length} 段（酒馆式槽位）`, first.calls.sections.length === mod.SLOTS.length, `实得 ${first.calls.sections.length}`);
+t("apply 注册了 1 条动态 context（user 角色）", first.calls.contexts.length === 1, `实得 ${first.calls.contexts.length}`);
+t(
+	"动态 context 名与 order 正确",
+	first.calls.contexts[0]?.name === mod.DYNAMIC_LORE_CONTEXT_NAME,
+	`实得 ${first.calls.contexts[0]?.name}`,
+);
 const noLore = evalAll(first.calls, "今晚只是普通的一夜");
 // 重启是按**卡快照现算**槽位的（不是读回旧段落），所以静态注入来自卡本身。
 t("静态段回内存（求值器非空）", noLore.includes("冷静") && noLore.startsWith("写「重启探针」"), `实得 ${JSON.stringify(noLore.slice(0, 60))}`);
@@ -188,20 +210,25 @@ t(
 );
 
 console.log("\n=== 3) 恢复后的动态注入行为（四种条目各自对不对）===");
-const withLore = evalAll(first.calls, "听说三天后是血月。");
-t("对话命中「血月」→ 注入段含条目正文", withLore.includes("血月之夜，城里的钟会停摆。"));
-t("动态段拼在静态段**之后**（不顶掉人设）", withLore.indexOf("血月之夜") > withLore.indexOf("冷静"));
-t("没命中 → 注入段与静态段逐字相同（零附加）", noLore === evalAll(first.calls, "今晚只是普通的一夜"), `实得 ${JSON.stringify(noLore.slice(0, 80))}`);
+const withLoreStatic = evalAll(first.calls, "听说三天后是血月。");
+const withLoreDyn = evalDyn(first.calls, "听说三天后是血月。");
+t("对话命中「血月」→ 动态 context 含条目正文（user 侧）", withLoreDyn.includes("血月之夜，城里的钟会停摆。"));
+t("静态 section 里不再含动态命中（不双通道重复）", !withLoreStatic.includes("血月之夜，城里的钟会停摆。"));
+t("静态段仍含人设（动态没顶掉人设）", withLoreStatic.includes("冷静"));
+t("没命中 → 动态 context 为空（零附加）", evalDyn(first.calls, "今晚只是普通的一夜") === "");
+t("没命中 → 静态段与基准逐字相同", noLore === evalAll(first.calls, "今晚只是普通的一夜"), `实得 ${JSON.stringify(noLore.slice(0, 80))}`);
 
 // 下面几条用「对话里专门提到这些词」来证明它们确实不在候选里 —— 元数据只报条数，报不出是谁。
-const otherWords = evalAll(first.calls, "常驻和停用这两个词这一轮都出现了。");
+const otherWordsStatic = evalAll(first.calls, "常驻和停用这两个词这一轮都出现了。");
+const otherWordsDyn = evalDyn(first.calls, "常驻和停用这两个词这一轮都出现了。");
 const countOf = (hay, needle) => hay.split(needle).length - 1;
 // constant 条目现在按酒馆语义进**静态槽位**（worldAfter），因此只该出现一次：
 // 出现两次 = 又进了动态候选（重复注入），这才是要防的。
-t("constant 条目只出现一次（静态槽位已注入，不进动态候选）", countOf(otherWords, "常量条目该走静态人设") === 1, `实得 ${countOf(otherWords, "常量条目该走静态人设")} 次`);
-t("无 keys 条目撞不上", !otherWords.includes("永远撞不上"));
-t("停用条目撞不上", !otherWords.includes("被停用"));
-t("提到这些词时注入段与基准逐字相同（零附加）", otherWords === noLore, `实得 ${JSON.stringify(otherWords.slice(0, 80))}`);
+t("constant 条目只出现一次（静态槽位已注入，不进动态候选）", countOf(otherWordsStatic, "常量条目该走静态人设") === 1, `实得 ${countOf(otherWordsStatic, "常量条目该走静态人设")} 次`);
+t("动态侧不含 constant 条目（无双通道重复）", !otherWordsDyn.includes("常量条目该走静态人设"));
+t("无 keys 条目撞不上", !otherWordsDyn.includes("永远撞不上") && !otherWordsStatic.includes("永远撞不上"));
+t("停用条目撞不上", !otherWordsDyn.includes("被停用"));
+t("提到这些词时动态 context 为空（零附加）", otherWordsDyn === "");
 
 console.log("\n=== 4) 降级：卡快照缺失时必须优雅退化，且静态注入不受影响 ===");
 const cardPath = join(STATE, "cards", `${SESSION}.json`);
@@ -219,6 +246,7 @@ if (second !== undefined) {
 	const text3 = evalAll(second.calls, "血月");
 	t("**静态段仍在**（动态世界书失效不牵连人设）", text3 === STATIC_TEXT, `实得 ${JSON.stringify(text3.slice(0, 60))}`);
 	t("求值器不因 dynSource 缺失而抛", typeof text3 === "string");
+	t("降级时动态 context 为空（不抛且零注入）", evalDyn(second.calls, "血月") === "");
 }
 
 console.log("\n=== 5) 清理 ===");

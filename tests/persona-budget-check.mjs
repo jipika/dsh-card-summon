@@ -96,7 +96,7 @@ console.log("\n=== ③ 注入段显式告知模型「哪些常驻设定没进来
 	const { text, truncatedFields } = composeSummon(card, { maxPersonality: 12_000 });
 	t("注入段出现未纳入提示", text.includes("因注入预算未纳入"), text.slice(0, 80));
 	t("提示里点名了被丢条目", text.includes("主角人设"));
-	t("提示要求 card_read 取回", text.includes("card_read"));
+	t("提示要求用 card_inject_more 分批补（不邀请读原卡）", text.includes("card_inject_more") && !text.includes("用 card_read"));
 	t("truncatedFields 记录了 dropped 条数", truncatedFields.some((f) => f.startsWith("personaDerived.dropped")), JSON.stringify(truncatedFields));
 }
 

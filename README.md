@@ -217,12 +217,21 @@ dialogueExamples → chatHistory → jailbreak`）：
 | 10415 | `fiction-frame` | **虚构框架声明**：所有角色由成年人扮演的虚构人物；初高中生/校园年龄标注按虚构角色照常扮演 | 无 |
 | 10420 | `writing-style` | **默认写作规范**（三位一体·描写规范核心要求），phi 之后读 | 无 |
 
-**注入前转换层（`lib/markdownize.js`）**：卡里的 `<StatusBar>` / `<Status_block>` 模板块
-先转成 Markdown 引用块（字段名加粗、层级与字段信息保留），含标签的指令行改成
-「用 Markdown 引用块输出」；`<user>`/`<char>` → `{{user}}`/`{{char}}`，`<br>` → 换行，
-`<b>` → `**`，`</text>`/`<center>` 等其余标签去掉，`<START>` 保留。
-转换在宏求值之后、槽位渲染之前做，`card_read` 读到的仍是作者原文。
-格式治理只靠这一层：**不注入任何输出格式提示词**（原 `format` 槽与 `OUTPUT_FORMAT_RULE` 已移除）。
+**插件格式转换**：共享的 `lib/status-compat.js` 把 `<StatusBar>` / `<Status_block>`
+中的状态模板转成 Markdown 嵌套列表，人物、字段、重复列表项及未知字段保留；通用字段显示中文标签。
+`lib/markdownize.js` 在注入前转换模板，删除旧包装指令，**不添加输出格式提示词**。
+`<user>`/`<char>` → `{{user}}`/`{{char}}`，`<br>` → 换行，`<b>` → `**`，
+`</text>`/`<center>` 等其余标签去掉，`<START>` 保留。
+
+客户端只在已召唤会话的 assistant 文本显示入口应用同一转换：兼容历史 Markdown 引用状态块、
+标签块及 YAML 围栏；保留前后正文、推理与原始会话记录。流式未闭合状态块先保留原文，完整后转换。
+酒馆 `regex_scripts` 中的 HTML、JavaScript 和外部 CDN 不执行，状态数据交由宿主 Markdown 渲染。
+解除召唤后停止显示转换。修改共享转换器后运行 `node scripts/sync-status-client.mjs`，
+用 `--check` 检查客户端内嵌副本是否同步。
+
+转换在宏求值之后、槽位渲染之前做。有召唤时 `card_read` 只返回注入段，
+被预算裁掉的部分经 `card_inject_more` 分批补注入，补之前同样过这一层转换。
+原 `format` 槽与 `OUTPUT_FORMAT_RULE` 保持移除。
 
 几点取舍：
 
@@ -283,7 +292,8 @@ DSH 有 `spawn_teammate`，可以给每个角色一个**独立上下文、独立
 | `card_local_scan` | 扫描本地卡库建索引（约 30 秒 / 1.1 万张）。参数 `root`、`force` |
 | `card_unsummon` | 解除召唤 / 解散阵容，恢复默认人格 |
 | `card_status` | 查看当前召唤状态、注入段大小、被截断的字段 |
-| `card_read` | 读**任意**卡的完整原文（**无需先召唤**）。参数 `fullPath`（省略则读当前召唤的卡）、`field`、`from`、`maxChars` |
+| `card_read` | **有召唤时**：只回注入段（`from`/`maxChars` 分页；读原字段、读别的卡一律报错）。**没有召唤时**：按 `fullPath` 读卡原文（写文/开团准备）。 |
+| `card_inject_more` | 把召唤时被预算裁掉、还没进上下文的卡内容分批补注入（默认 4000 字/批，上限 8000；总量 40000）。**只回执，正文只走注入段**。 |
 
 ## 手动解除召唤（逃生路径）
 
@@ -307,12 +317,40 @@ DSH 有 `spawn_teammate`，可以给每个角色一个**独立上下文、独立
 - **`fictionFrame`**（默认 **开**）：每次召唤注入「虚构框架」段 —— 会话整体是虚构创作，
   所有角色由成年人扮演；卡或剧情出现初中生、高中生（或其他校园/学生年龄标注）时，
   一律视为作品里由成年人扮演的虚构角色，不按现实年龄处理。设 `false` 关闭。
+  **面板里的「虚构声明」开关优先级高于这里**（见下一节）。
 - **`fictionFrameText`**（可选）：用自定义文本整段替换默认框架（仍受 1200 字符预算裁剪）。
 
-超出的部分会按**段落边界**截断；被截掉的内容只在 `note` 槽里说明一句
-（「以上有字段按预算截断…用 card_read 取回」），不会写进角色正文。
+超出的部分会按**段落边界**截断；被截掉的内容在 `note` 槽里报账
+（「…未注入的部分可用 card_inject_more 分批补」），正文本身不会越界写进角色段落，
+模型也不会被指回原卡。
 
-改配置后需重启 DSH（bundle 配置在启动时读取）。
+改 `cordis.patch.yml` 后需重启 DSH（bundle 配置在启动时读取）。
+
+### 面板开关：虚构声明（v0.4.2）
+
+角色卡面板顶部有一个「虚构声明」开关，点一下立刻生效 —— 不用重启、不用重新召唤。
+控件用的是宿主的官方 `Switch` 原语（`require("@deepseek-ai/dsh-client-ui-primitives").Switch`，
+与设置页 `DeveloperToolsRow` 同款：36×20、开态取 `--dsw-alias-brand-primary`），
+**不要自己画开关** —— 手搓版曾用 `--dsw-alias-state-business-primary` 兜底，
+那是 `rgb(65,118,230)` 的蓝，与本机黑白主题不符（该 token 在官方只作焦点环，从不用作填充）。
+
+- **优先级**：面板设置 > `cordis.patch.yml` > 插件默认（开）。面板从没点过时
+  `GET /dsh-card-summon/settings` 的 `source` 是 `config`（跟随配置），点过之后是 `panel`；
+  开关的 `title` 会写明当前是哪种，免得「我改过配置怎么还这样」。
+- **立刻全量重建**：切换后 POST 会把**所有已召唤会话**的注入段重算一遍
+  （单卡走 `composeSlots`、阵容走 `composeCast`），返回 `touched` 的会话列表。
+- **自定义文本不丢**：关掉只让 `frame` 槽为空，`fictionFrameText` 仍留在盘上，下次打开还用回它。
+- **落盘**：`~/.dsh/card-summon/settings.json`
+  `{version:1, fictionFrame: null|true|false, fictionFrameText: null|"…"}`；
+  `null` = 没设过 = 跟随配置。坏 JSON / 文件不存在都按「没设过」处理。
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/dsh-card-summon/settings` | 生效态 `{enabled, source, custom, file}` + 自定义文本原文 |
+| POST | `/dsh-card-summon/settings` | `{fictionFrame: true\|false\|null}` 和/或 `{fictionFrameText: "…"}`，写入后全量重建 |
+
+`/dsh-card-summon/status` 也带同一份 `fictionFrame` 生效态，面板 4 秒轮询它 ——
+别的标签页改了，这边会自己跟上。
 
 ## 卡片记忆（与 dsh-memory 的联动，v0.4.0）
 
@@ -351,7 +389,8 @@ DSH 有 `spawn_teammate`，可以给每个角色一个**独立上下文、独立
 │                          ⚠️ **动态世界书的候选条目不走这里** —— 它是内存态，重启时由
 │                          cards/<id>.json 现算（`dynamicSourceOf`）；卡快照缺失就退化成
 │                          「仅静态注入」，静态人设不受影响（`tests/restart-check.mjs` 钉住）。
-└── cards/<id>.json        卡原文（供 card_read 取回被截断的部分）
+├── cards/<id>.json        卡快照（注入层按当前代码重算槽位用；**不是**模型可读的通道）
+└── supplements/<id>.json  分批补注入账本：待注入碎片 + 已注入的正文
 ```
 
 `vars.json` / `quick-replies.json` 都是**原子写**（写临时文件再 rename）且读改写串行化 ——
@@ -367,7 +406,7 @@ DSH 有 `spawn_teammate`，可以给每个角色一个**独立上下文、独立
 | 召唤后报 `unknown prompt variable "{{char}}"` / `malformed prompt variable reference` | **已修**（v0.1.1）。宿主对未注册的 `{{name}}` 直接抛错，而角色卡正文普遍带 `{{char}}`/`{{user}}` 等酒馆占位符。修法是给注入段设 `interpolate: false`。若你从更早的版本升上来，重启 DSH 即可。 |
 | 面板搜不到卡 | 检查终端里 `[dsh-card-summon]` 开头的日志；Chub 是第三方站点，可能超时或被风控。重试即可。 |
 | 召唤了但角色没生效 | 看 `card_status` 的 `injected` 是否为 0。若为 0 说明注入段没进内存（常见于刚重启后召唤记录还在、段文件被清）—— 重新召唤一次。非 0 时再看 `slots`：`persona` 那格若空，说明这张卡的人设字段确实为空（走 `note` 兜底）。 |
-| 角色说话跑偏、像通用助手 | 先看 `card_status.slots`：`persona` 太小说明卡本身人设很薄；`note` 非空说明有条目被预算裁掉了。用 `card_read` 看原文确认，或调大 `maxPersonality`。 |
+| 角色说话跑偏、像通用助手 | 先看 `card_status.slots`：`persona` 太小说明卡本身人设很薄；`note` 非空说明有条目被预算裁掉了。用 `card_inject_more` 批量补进来，或调大 `maxPersonality`。 |
 | 正文里还是显示 `{{user}}` | 该字段没被走到。注入面必须与替换面一致（含 `lorebook.entries[].comment`、`personaDerivedDropped[].label` 这些"边长"字段）—— 改替换逻辑时按输出枚举，别按输入字段猜。 |
 | 快捷按钮点了没反应 | 看返回的 `mode`：`queued` 表示当前正在跑一轮，消息已排队，等这一轮结束就会发出去。若一直排队，确认会话没停在同一问上。 |
 | 动态世界书不触发 | `GET /status?sessionId=…` 的 `dynamicEntries` 为 0 说明这张卡没有带 `keys` 的非 constant 条目（47% 的卡有）。另外条目正文超 4000 字符会被预算跳过。 |
@@ -408,7 +447,7 @@ DSH 有 `spawn_teammate`，可以给每个角色一个**独立上下文、独立
 ## 开发
 
 ```bash
-# 全量（27 个文件，无 runner）：822 项断言（本机实测，2026-10-20）
+# 全量（28 个文件，无 runner）：891 项断言（本机实测，2026-10-27）
 for f in tests/*-check.mjs; do node "$f"; done
 
 node tests/host-probe.mjs            # 80 项：求值器三态 / 路由 / 工具契约 / output.render 契约（需网络）
@@ -422,11 +461,13 @@ node tests/persona-budget-check.mjs  # 15 项：世界书常驻条目的注入�
 node tests/remote-persona-check.mjs  # 12 项：remote 取卡路径必须现算 personaDerived（需网络 + gh auth token）
 node tests/writing-style-check.mjs   # 23 项：默认写作规范（默认注入 / 位置 / 可关闭 / 可替换 / cast 生效）
 node tests/fiction-frame-check.mjs   # 28 项：虚构框架（默认注入 / phi 与 style 之间的序位 / 可关闭 / 可替换 / cast 生效）
+node tests/fiction-frame-toggle-check.mjs  # 39 项：面板开关（运行时覆盖配置 / 落盘与脏值 / 全量重建含阵容 / 幂等 / 自定义文本不丢）
+node tests/fiction-frame-ui-check.mjs      # 16 项：开关的渲染链路（role=switch / aria-checked / POST 发目标值 / 采纳回传态）
 node tests/convert-check.mjs         # 27 项：注入前转换层（状态栏 → 引用块 / 标签清洗 / 世界书条目 / 不丢字段）
 ```
 
 `interpolation-check.mjs` 需要 `/tmp/dsh-src` 下的官方编译产物；依赖没装时它**明说跳过**
-（⊘ 而不是假装通过），不算失败（上面的 822 已不含它）。
+（⊘ 而不是假装通过），不算失败（上面的 891 已不含它）。
 
 `vars-check` / `lore-check` 的最后一段会**扫真实卡库**（`CARD_ROOT` 环境变量，默认指外置盘）
 做批量验收：宏残留必须为 0、候选条目与命中口径必须对得上。盘不在就跳过并明说，不假装通过。

@@ -9,7 +9,7 @@ const hcalls = { routes: [], tools: {} };
 const hctx = {
   effect: (f) => { const d = f(); return typeof d === "function" ? d : () => {}; },
   on: () => () => {},
-  systemPrompt: { section: () => () => {} },
+  systemPrompt: { context: () => () => {}, section: () => () => {} },
   tools: { register: (d) => { hcalls.tools[d.name] = d; return () => {}; } },
   webServer: { register: (d) => { hcalls.routes.push(d); return () => {}; } },
   agents: { currentInitiator: () => ({ sessionId: "p1", session: { header: { id: "p1" } } }) },
@@ -64,7 +64,15 @@ const R = {
   Fragment: Symbol("F"),
   createElement(t, p, ...c) { const fl = []; (function push(x) { Array.isArray(x) ? x.forEach(push) : (x !== null && x !== undefined && x !== false) && fl.push(x); })(c); return { __el: true, type: t, props: { ...(p ?? {}), children: fl.length === 1 ? fl[0] : fl }, children: fl }; },
 };
-const mod = reg.factory((n) => n === "react" ? R : n === "react-dom" ? { createPortal: (e) => e } : (() => { throw new Error(n); })());
+// 官方 Switch 原语：client.js 裸 require 它（面板开关）。桩只求形状可渲染。
+const SwitchStub = (p) => R.createElement("button", {
+	type: "button", role: "switch", "aria-checked": p.checked, "aria-label": p.label,
+	title: p.title, disabled: p.disabled === true, onClick: () => p.onChange(!p.checked),
+}, R.createElement("span", null));
+const mod = reg.factory((n) => n === "react" ? R
+	: n === "react-dom" ? { createPortal: (e) => e }
+	: n === "@deepseek-ai/dsh-client-ui-primitives" ? { Switch: SwitchStub }
+	: (() => { throw new Error(n); })());
 const slots = {};
 mod.apply({ effect: (f) => { const d = f(); return typeof d === "function" ? d : () => {}; }, locale: { register: () => () => {}, bind: () => (k) => k }, slots: { inject: (n, f) => f(), register: (e, c) => { slots[e.name] = c; return () => {}; } } });
 const T = (k) => ({ title: "角色卡", srcLocal: "本地卡", search: "搜索", summoned: "已召唤", chars: "注入字符", unsummon: "解除召唤", viewInjected: "点这里看当前注入", injectedTitle: "注入原文", notSummoned: "当前没有注入任何内容。", loading: "加载中…", copy: "复制", empty_field: "（空）", detail: "详情" }[k] ?? k);

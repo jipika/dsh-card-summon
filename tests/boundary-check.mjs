@@ -50,7 +50,8 @@ t("personality 被截断", c.truncatedFields.includes("personality"));
 t("scenario 被截断", c.truncatedFields.includes("scenario"));
 t("example_dialogs 被截断", c.truncatedFields.includes("example_dialogs"));
 t("first_message 被截断", c.truncatedFields.includes("first_message"));
-t("截断后有 card_read 提示", c.text.includes("card_read"));
+t("截断后指向 card_inject_more（不再邀请读原卡）", c.text.includes("card_inject_more"));
+t("注入段里不出现 card_read 邀请", !c.text.includes("用 card_read"));
 t("总长受控 (<40k)", c.chars < 40000, `实际 ${c.chars}`);
 
 console.log("\n=== maxPersonality 配置生效 ===");

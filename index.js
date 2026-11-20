@@ -62,6 +62,7 @@ import {
 	hasAssistantMessage,
 	mergeDynamicSources,
 	recentTextOf,
+	renderSlotsText,
 	DYNAMIC_SCAN_DEPTH,
 	SLOTS,
 	SECTION_NAME,
@@ -73,16 +74,19 @@ import {
 	STATE_ROOT,
 	MAX_SUMMON_SESSIONS,
 	clearSummon,
+	clearSupplementFile,
 	getSummon,
 	listSummons,
 	loadCardFile,
 	loadSectionFromDisk,
+	loadSupplementFile,
 	pruneSummons,
 	sessionIdOf,
 	setSummon,
 	sweepSectionFiles,
 	writeCardFile,
 	writeSectionFile,
+	writeSupplementFile,
 } from "./lib/state.js";
 import {
 	extractFromCard,
@@ -98,6 +102,15 @@ import {
 	resolveQuickReplies,
 	updateQuickReply,
 } from "./lib/quick-replies.js";
+import {
+	composeOpts,
+	fictionFrameState,
+	invalidateSettingsCache,
+	MAX_FRAME_TEXT,
+	setFictionFrame,
+	setFictionFrameText,
+	settingsPath,
+} from "./lib/settings.js";
 
 export const name = "dsh-card-summon";
 // sessions / sessionController 只服务 Quick Reply 的投递（把按钮正文当作「用户发的消息」）。
@@ -105,6 +118,10 @@ export const name = "dsh-card-summon";
 export const inject = ["systemPrompt", "tools", "webServer", "agents", "sessions", "sessionController"];
 
 const ROUTE = "/dsh-card-summon";
+
+/** 动态世界书的 user 上下文名与顺序（systemPrompt.context，不是 section）。 */
+export const DYNAMIC_LORE_CONTEXT_NAME = "dsh-card-summon:dynamic-lore";
+export const DYNAMIC_LORE_CONTEXT_ORDER = 500;
 
 function log(...args) {
 	console.log("[dsh-card-summon]", ...args);
@@ -651,7 +668,7 @@ let remoteIndexCache = null;
  *              一屏 ≈ 20.6MB），之后命中本地缩略图缓存就快了
  * 所以这不是「两批不同的卡」，而是「同一批卡的两种取法」——文案要准确。
  */
-let preferredOrigin = "remote";
+let preferredOrigin = "local";
 
 function getPreferredOrigin() {
 	return preferredOrigin;
@@ -708,20 +725,45 @@ function slotSizesOf(hit) {
 	return out;
 }
 
-/** 抓卡 + 渲染 + 落盘，然后把段塞进内存 Map。这是唯一会走网络的地方。 */
-async function buildSection(sessionId, card, cfg) {
-	// 按酒馆的槽位模型渲染：每个槽位一条 section（顺序与依据见 lib/inject.js 的 SLOTS）。
-	const composed = composeSlots(card, {
-		maxPersonality: cfg?.maxPersonality,
-		writingStyle: cfg?.writingStyle,
-		writingStyleText: cfg?.writingStyleText,
-		fictionFrame: cfg?.fictionFrame,
-		fictionFrameText: cfg?.fictionFrameText,
-	});
-	if (composed.text.length === 0) {
-		throw new Error(`卡 ${card?.fullPath ?? "(未知)"} 渲染出的注入段为空（可能没有 name/personality）`);
-	}
-	sections.set(sessionId, {
+/**
+ * 阵容快照 → sections 记录（不含落盘）。
+ *
+ * 阵容没有单卡槽位模型：整段进 main 槽，其余槽位留空（求值器返回空串即不注入）。
+ *
+ * 抽成函数的原因是**唯一真源**：重启恢复（apply）与运行时开关后的重建
+ * （rerenderSessionsFor）必须产出完全一样的形状。上一版这两处是各写一遍，
+ * 而 rerenderSessionsFor 那处干脆漏了 cast 分支 —— 全量重建时会把阵容快照
+ * 当单卡喂给 composeSlots（卡快照是 `{kind:"cast", members}`，没有 name/personality），
+ * 结果抛「渲染出的注入段为空」或渲染出一段空壳。加开关要全量重建，这条必须同时修。
+ */
+function castSectionOf(card, cfg) {
+	const members = Array.isArray(card?.members) ? card.members : [];
+	const composed = composeCast(members, composeOpts(cfg));
+	return {
+		slots: { main: composed.text },
+		text: composed.text,
+		chars: composed.chars,
+		truncatedFields: composed.truncatedFields,
+		fullPath: members.map((m) => m?.card?.fullPath ?? "").join(","),
+		name: `阵容(${composed.cast.length}人)：${composed.cast.join("、")}`,
+		kind: "cast",
+		dynSource: mergeDynamicSources(members.map((m) => m?.card ?? m)),
+		at: new Date().toISOString(),
+	};
+}
+
+/**
+ * 卡快照 → sections 记录（纯计算，不落盘）。单卡与阵容都从这里出，形状唯一。
+ *
+ * 三条路径共用它：建段（召唤时）、重启恢复（apply）、运行时重建（rerenderSessionsFor）。
+ * 以前它们各写一遍，散落的 `cfg?.fictionFrame` 就是「面板改了值、某条路径不跟随」的温床。
+ */
+function sectionRecordOf(card, cfg) {
+	if (card?.kind === "cast") return castSectionOf(card, cfg);
+	// collectReserve：把预算裁掉的碎片一起算出来（分批补注入的唯一来源）。
+	// 只在建段时收 —— 面板预览/状态查询不需要，也就不多切一遍字符串。
+	const composed = composeSlots(card, { ...composeOpts(cfg), collectReserve: true });
+	return {
 		// 槽位表是求值器的唯一数据源：每条 section 只读自己那一格。
 		slots: composed.slots,
 		text: composed.text,
@@ -729,15 +771,88 @@ async function buildSection(sessionId, card, cfg) {
 		name: card.name,
 		chars: composed.chars,
 		truncatedFields: composed.truncatedFields,
+		// 待补注入的碎片（未进首屏的卡内容）。落进 supplements 账本，不进提示词。
+		reserve: Array.isArray(composed.reserve) ? composed.reserve : [],
 		minorFlag: detectMinorFlag(card),
 		// 动态世界书的候选条目（keys + 正文），求值器每轮拿它撞关键词。见 dynamicSourceOf。
 		// 正文走注入前转换（标签/状态栏 → Markdown），与静态段保持同一份文本。
 		dynSource: dynamicSourceOf(markdownizeCard(card)),
 		// 卡自带的 depth_prompt（酒馆默认 depth=4 / role=system），已并入 phi 槽。
 		at: new Date().toISOString(),
-	});
+	};
+}
+
+/* ────────────── 分批补注入：账本 + 段内追加 ────────────── */
+
+/** 单批默认/上限字符数。一批就是一个 section 变更，太大等于把首屏预算挪到第二屏。 */
+const SUPPLEMENT_BATCH_CHARS = 4_000;
+const SUPPLEMENT_BATCH_MAX = 8_000;
+/** 补注入总量上限：防止一张 20 万字的卡靠反复调用把上下文慢慢撑爆。 */
+const SUPPLEMENT_TOTAL_MAX = 40_000;
+
+const pendingItems = (supp) => (Array.isArray(supp?.items) ? supp.items : []).filter((x) => x?.used !== true);
+const pendingChars = (supp) => pendingItems(supp).reduce((n, x) => n + String(x?.body ?? "").length, 0);
+
+/** 新建/重写账本（召唤那一刻）。 */
+function seedSupplement(sessionId, record) {
+	const items = (Array.isArray(record?.reserve) ? record.reserve : []).map((x) => ({
+		label: x.label,
+		body: x.body,
+		chars: x.chars ?? String(x.body ?? "").length,
+		used: false,
+	}));
+	writeSupplementFile(sessionId, { fullPath: record.fullPath, items, batch: 0, extended: "" });
+	return items.length;
+}
+
+/**
+ * 把账本叠回段上：已补注入的正文进 `extended` 槽，`text` 按槽位重拼。
+ *
+ * 为什么重拼而不是把 text 存盘读回：槽位是求值器的真源，text 只是派生物
+ * （面板、card_read、落盘用）。派生值一旦落后于槽位，模型读到的「注入段」
+ * 就和实际注入的不是同一份 —— 那正是这次要消灭的问题。
+ */
+function overlaySupplement(record, supp) {
+	if (record === undefined || supp === undefined) return record;
+	if (supp.fullPath !== record.fullPath) return record;
+	const extended = String(supp.extended ?? "");
+	if (extended.length > 0) {
+		record = { ...record, slots: { ...record.slots, extended } };
+		record.text = renderSlotsText(record.slots);
+		record.chars = record.text.length;
+	}
+	record.supplement = { batch: Number(supp.batch ?? 0), pending: pendingItems(supp).length };
+	return record;
+}
+
+/**
+ * 建段后挂账本：
+ *   · reseed=true（召唤/重新召唤）→ 用本次算出的 reserve 重写账本；
+ *   · reseed=false（重启恢复/开关重建）→ 账本存在就叠回去，不存在才按 reserve 补种。
+ * 恢复路径**绝不能**重写账本：那会抹掉已经补注入的正文，也会让未注入的碎片重复排队。
+ */
+function hydrateSupplement(sessionId, record, { reseed = false } = {}) {
+	if (record === undefined || record?.kind === "cast") return record;
+	const existing = loadSupplementFile(sessionId);
+	if (!reseed && existing !== undefined) return overlaySupplement(record, existing);
+	seedSupplement(sessionId, record);
+	const fresh = loadSupplementFile(sessionId);
+	return overlaySupplement(record, fresh);
+}
+
+/** 抓卡 + 渲染 + 落盘，然后把段塞进内存 Map。这是唯一会走网络的地方。 */
+async function buildSection(sessionId, card, cfg, { reseed = true } = {}) {
+	// 按酒馆的槽位模型渲染：每个槽位一条 section（顺序与依据见 lib/inject.js 的 SLOTS）。
+	// opts 一律走 composeOpts —— 它把面板运行时开关（settings.json）叠在 patch.yml 的 cfg 上，
+	// 见 lib/settings.js 的「单一入口」说明。
+	let record = sectionRecordOf(card, cfg);
+	if (record.text.length === 0) {
+		throw new Error(`卡 ${card?.fullPath ?? "(未知)"} 渲染出的注入段为空（可能没有 name/personality）`);
+	}
+	record = hydrateSupplement(sessionId, record, { reseed });
+	sections.set(sessionId, record);
 	try {
-		writeSectionFile(sessionId, composed.text);
+		writeSectionFile(sessionId, record.text);
 		writeCardFile(sessionId, card);
 	} catch (error) {
 		log("段落盘失败（不影响本次注入）", error?.message ?? error);
@@ -910,9 +1025,14 @@ function toolSummon(ctx, cfg) {
 				injectedChars: section.chars,
 				via: card.via ?? "local",
 				truncatedFields: section.truncatedFields,
+				supplement: section.supplement ?? null,
 				tags: card.tags.slice(0, 12),
 				view: cardView(card),
-				note: "注入已生效，从下一轮请求开始按该角色身份回应。",
+				note:
+					"注入已生效，从下一轮请求开始按该角色身份回应。" +
+					(section.supplement?.pending > 0
+						? `另有 ${section.supplement.pending} 条设定按预算未进首屏，需要时用 card_inject_more 分批补。`
+						: ""),
 			};
 		},
 	};
@@ -950,12 +1070,22 @@ function toolStatus(ctx) {
 			if (sessionId === undefined) throw new Error("card_status: 取不到当前会话 id");
 			const record = getSummon(sessionId);
 			const section = sections.get(sessionId);
+			const supp = loadSupplementFile(sessionId);
 			return {
 				summoned: record !== undefined,
 				record: record ?? null,
 				injected: section?.chars ?? 0,
 				// 每个槽位的实际字符数（空槽位不列）。用来确认"角色正文到底进了哪一段"。
 				slots: slotSizesOf(section),
+				// 分批补注入的进度：还有多少条/多少字没进来（0 表示首屏已装下全部内容）
+				supplement:
+					supp === undefined
+						? null
+						: {
+								batch: Number(supp.batch ?? 0),
+								pendingItems: pendingItems(supp).length,
+								pendingChars: pendingChars(supp),
+							},
 				// 这张卡是从远端拉的还是从本地磁盘读的（远程优先后，静默降级要可观测）
 				via: record?.via ?? null,
 				truncatedFields: section?.truncatedFields ?? [],
@@ -1054,6 +1184,15 @@ function toolCast(ctx, cfg) {
 
 			// 只读模式（默认）：把每张卡的人设正文直接给出来
 			if (args?.inject !== true) {
+				// 有召唤的会话一律不给原文 —— 否则它就是 card_read 之外的第二条「回原卡」通道
+				// （模型完全可以用 card_cast 把当前这张卡的原文再读一遍，连转换层都省了）。
+				const liveId = currentSessionId(ctx);
+				if (liveId !== undefined && sections.get(liveId) !== undefined) {
+					throw new Error(
+						"card_cast: 本会话已有注入的卡，只读模式会直接返回卡原文，已停用。" +
+							"要换阵容请用 card_cast({members, inject:true})；要补设定用 card_inject_more。",
+					);
+				}
 				return {
 					ok: true,
 					mode: "read-only",
@@ -1066,7 +1205,7 @@ function toolCast(ctx, cfg) {
 							name: card.name,
 							source: card.source ?? "chub",
 							role: role ?? null,
-							// 正文直接给（这是"让智能体读到卡"的关键 —— 不需要再调 card_read）
+							// 正文直接给 —— 仅在**没有召唤**的会话可用（有召唤的会话走注入段，见 card_read 的边界）
 							personality: r.fields.personality?.text ?? "",
 							scenario: r.fields.scenario?.text ?? "",
 							firstMessage: r.fields.first_message?.text ?? "",
@@ -1080,7 +1219,6 @@ function toolCast(ctx, cfg) {
 					note:
 						"以上是各角色的人设正文（未注入会话，你的默认人格不变）。" +
 						"直接按这些人设扮演即可，用【角色名】区分发言。" +
-						"需要更多细节（例对话/世界书）就 card_read({fullPath}) 只取那一段。" +
 						"想让阵容持续注入后续每一轮，改用 card_cast({members, inject:true})。",
 				};
 			}
@@ -1089,11 +1227,9 @@ function toolCast(ctx, cfg) {
 			const sessionId = currentSessionId(ctx);
 			if (sessionId === undefined) throw new Error("card_cast: 取不到当前会话 id（无法注入）");
 			const composed = composeCast(cast, {
+				// 与单卡同源：运行时开关由 composeOpts 叠加（面板关掉框架，阵容也必须跟着关）
+				...composeOpts(cfg),
 				maxPersonalityPerRole: perRole,
-				writingStyle: cfg?.writingStyle,
-				writingStyleText: cfg?.writingStyleText,
-				fictionFrame: cfg?.fictionFrame,
-				fictionFrameText: cfg?.fictionFrameText,
 			});
 			if (composed.text.length === 0) throw new Error("card_cast: 渲染出的阵容注入段为空");
 			const minorFlag = flags.length > 0 ? { flagged: true, hits: flags.flatMap((x) => x.flag.hits) } : { flagged: false };
@@ -1196,31 +1332,48 @@ function toolLocalScan(ctx, cfg) {
 	};
 }
 
+/**
+ * 当前会话**已经注入给模型的那一段** —— card_read 在有召唤时唯一的数据源。
+ *
+ * 为什么不再读卡快照：注入段经 markdownize 转换（作者的状态栏模板 → Markdown 引用块）
+ * 并按预算裁剪过。模型照着注入段写，格式才可控；把原卡喂回去等于整层绕开转换，
+ * 实测模型会立刻复刻卡的 `<details><summary>…</summary>` 面板与 `<customize_cot>` 协议。
+ *
+ * 段还没进内存（刚重启）时退回落盘的段文本 —— 仍然是「注入过的」，不是原卡。
+ */
+function injectedViewOf(sessionId) {
+	const hit = sections.get(sessionId);
+	if (hit !== undefined) return hit;
+	const record = getSummon(sessionId);
+	if (record === undefined) return undefined;
+	const disk = loadSectionFromDisk(sessionId);
+	if (disk === undefined) return undefined;
+	return { slots: { main: disk }, text: disk, chars: disk.length, fullPath: record.fullPath, name: record.name };
+}
+
 function toolRead(ctx) {
 	return {
 		name: "card_read",
 		description:
-			"读取**任意**角色卡的完整原文 —— 不需要先召唤。用于「让智能体自己读卡」的场景：" +
-			"开团（一次读多张卡，各演一个角色）、写文（取人设/世界书做素材）、" +
-			"或取回召唤时被截断的字段。" +
-			"不传 fullPath 时读当前会话已召唤的那张（缓存优先，不再回网）。" +
-			"字段：personality / description / scenario / first_message / example_dialogs / " +
-			"system_prompt / post_history_instructions / alternate_greetings / lorebook / all。" +
-			"长文用 from/maxChars 分段读（返回 nextFrom，非 null 表示还有后续）。",
+			"读回本会话**已注入**的角色卡内容（注入段全文，可分页）。" +
+			"有召唤时这不是原卡：作者的状态栏/标签模板在注入前已被改写成 Markdown，被预算裁掉的部分也不在里面。" +
+			"没进注入的设定用 card_inject_more 分批补 —— 不要去找原卡，也读不到。" +
+			"没有召唤的会话（写文 / 开团准备）才允许按 fullPath 读卡原文。",
 		parameters: {
 			type: "object",
 			properties: {
 				fullPath: {
 					type: "string",
 					description:
-						"要读的卡路径（card_search 结果的 fullPath；中文站卡形如 sichang://<slug>）。" +
-						"省略则读当前会话已召唤的卡。",
+						"可选：要读的卡路径。有召唤时只接受本会话那张（传别的会报错）；" +
+						"没有召唤时用它读卡原文（card_search 结果的 fullPath）。",
 				},
 				field: {
 					type: "string",
-					description: "要取回的字段，默认 all。",
+					description: "有召唤时只认 all（= 注入段全文）；其余字段名仅为无召唤的原文读取保留。",
 					enum: [
 						"all",
+						"injected",
 						"personality",
 						"description",
 						"scenario",
@@ -1244,26 +1397,180 @@ function toolRead(ctx) {
 			const from = Math.max(0, Number(args?.from) || 0);
 			const field = String(args?.field ?? "all");
 			const ref = String(args?.fullPath ?? "").trim();
+			const sessionId = currentSessionId(ctx);
 
-			// 指定了 fullPath → 直接从数据源取（**不需要**先召唤；这是「智能体自己读卡」的主路径）
+			// ── 有召唤：只回注入段 ──
+			const injected = sessionId === undefined ? undefined : injectedViewOf(sessionId);
+			if (injected !== undefined) {
+				if (ref.length > 0 && ref !== injected.fullPath) {
+					throw new Error(
+						`card_read: 本会话已召唤「${injected.name}」，只提供它的注入段。` +
+							`要读别的卡请另开会话，或先 card_unsummon。`,
+					);
+				}
+				if (field !== "all" && field !== "injected") {
+					throw new Error(
+						`card_read: 已召唤的会话只提供注入段（field=all）。` +
+							`卡里没进注入的设定请用 card_inject_more 分批补，不要去找原卡。`,
+					);
+				}
+				const text = String(injected.text ?? "");
+				const slice = text.slice(from, from + maxChars);
+				const supp = sessionId === undefined ? undefined : loadSupplementFile(sessionId);
+				return {
+					mode: "injected",
+					fullPath: injected.fullPath,
+					name: injected.name,
+					source: "session-section",
+					chars: text.length,
+					from,
+					nextFrom: from + maxChars < text.length ? from + maxChars : null,
+					text: slice,
+					...(supp === undefined
+						? {}
+						: {
+								supplement: {
+									batch: Number(supp.batch ?? 0),
+									pendingItems: pendingItems(supp).length,
+									pendingChars: pendingChars(supp),
+								},
+							}),
+				};
+			}
+
+			// ── 无召唤：原文读取（写文 / 开团准备），行为与旧版一致 ──
 			if (ref.length > 0) {
 				const card = await fetchAnyCard(ref, { signal: execCtx?.signal });
 				const r = readCardField(card, { field, from, maxChars });
-				return { fullPath: card.fullPath, name: card.name, source: card.source ?? "chub", from: ref.length > 0 ? from : 0, ...r };
+				return { fullPath: card.fullPath, name: card.name, source: card.source ?? "chub", from, ...r };
+			}
+			throw new Error(
+				"card_read: 没传 fullPath，且当前会话没有已召唤的卡。" +
+					"想读某张卡就传 fullPath（如 card_read({fullPath: \"creator/slug\"})）—— 无需先召唤。",
+			);
+		},
+	};
+}
+
+/**
+ * card_inject_more：把召唤时被预算裁掉、还没进上下文的卡内容，按批补注入。
+ *
+ * 为什么要有它：预算永远比卡小，而「模型自己回原文里找」是唯一能把格式治理整层绕开的动作。
+ * 所以补内容也不能把正文还给模型 —— 只把它塞进注入段，返回值只给回执（注入了哪几条、还剩多少）。
+ * 模型看到的每一个字都必须来自注入段，这样格式与预算就只有一条通道。
+ */
+function toolInjectMore(ctx) {
+	return {
+		name: "card_inject_more",
+		description:
+			"把本会话**还没注入**的卡内容（召唤时被预算裁掉的常驻设定、被截断的字段尾巴、没用上的示例）" +
+			"分批补注入系统提示。每批约 4000 字，直接进上下文；返回值只有回执（哪几条、还剩多少字），" +
+			"正文不经过工具结果。一次补不完就再调一次。不要去读卡原文 —— 读不到，也没必要。",
+		parameters: {
+			type: "object",
+			properties: {
+				maxChars: {
+					type: "number",
+					description: "本批最多注入多少字符，默认 4000，上限 8000。",
+				},
+			},
+			required: [],
+			additionalProperties: false,
+		},
+		output: { schema: { type: "object", additionalProperties: true }, render: jsonRender },
+		async execute(args) {
+			const sessionId = currentSessionId(ctx);
+			if (sessionId === undefined) throw new Error("card_inject_more: 取不到当前会话 id");
+			const record = sections.get(sessionId);
+			if (record === undefined) {
+				throw new Error("card_inject_more: 当前会话没有已召唤的卡（或注入段尚未恢复）。");
+			}
+			if (record.kind === "cast") {
+				throw new Error("card_inject_more: 阵容模式没有分批注入的账本；单卡召唤才支持。");
+			}
+			const supp = loadSupplementFile(sessionId);
+			if (supp === undefined) {
+				return { ok: true, added: [], addedChars: 0, remainingChars: 0, note: "这张卡没有未注入的内容。" };
+			}
+			const pending = pendingItems(supp);
+			if (pending.length === 0) {
+				return {
+					ok: true,
+					batch: Number(supp.batch ?? 0),
+					added: [],
+					addedChars: 0,
+					remainingChars: 0,
+					note: "卡内容已全部注入。",
+				};
+			}
+			const budget = Math.min(SUPPLEMENT_BATCH_MAX, Math.max(500, Number(args?.maxChars) || SUPPLEMENT_BATCH_CHARS));
+			const injectedChars = (Array.isArray(supp.items) ? supp.items : [])
+				.filter((x) => x?.used === true)
+				.reduce((n, x) => n + String(x?.body ?? "").length, 0);
+			const room = Math.max(0, SUPPLEMENT_TOTAL_MAX - injectedChars);
+			if (room === 0) {
+				return {
+					ok: true,
+					added: [],
+					addedChars: 0,
+					remainingChars: pendingChars(supp),
+					note: `补注入已达上限（${SUPPLEMENT_TOTAL_MAX} 字）。剩余内容按已有设定发挥，不要自行编造。`,
+				};
 			}
 
-			// 未指定 → 读当前会话已召唤的卡（缓存优先）
-			const sessionId = currentSessionId(ctx);
-			if (sessionId === undefined) throw new Error("card_read: 取不到当前会话 id");
-			const cached = loadCardFile(sessionId);
-			if (cached === undefined) {
-				throw new Error(
-					"card_read: 没传 fullPath，且当前会话没有已召唤的卡。" +
-						"想读某张卡就传 fullPath（如 card_read({fullPath: \"creator/slug\"})）—— 无需先召唤。",
-				);
+			const take = [];
+			let used = 0;
+			for (const item of pending) {
+				const len = String(item.body ?? "").length;
+				// 第一条再长也放行（否则超大条目永远补不进来），其余按预算整条装。
+				if (take.length > 0 && used + len > budget) break;
+				if (used + len > room) break;
+				take.push(item);
+				used += len;
 			}
-			const r = readCardField(cached, { field, from, maxChars });
-			return { fullPath: cached.fullPath, name: cached.name, source: cached.source ?? "chub", from: "session-cache", ...r };
+			if (take.length === 0) {
+				return {
+					ok: true,
+					added: [],
+					addedChars: 0,
+					remainingChars: pendingChars(supp),
+					note: "本批装不下（剩余空间不足），可以再调一次或结束补注入。",
+				};
+			}
+
+			// 账本：标记已注入 + 记录批次与累计正文
+			for (const item of take) item.used = true;
+			const batch = Number(supp.batch ?? 0) + 1;
+			const block = [
+				`【补充设定 · 第 ${batch} 批】`,
+				...take.map((x) => `## ${x.label}\n${x.body}`),
+			].join("\n\n");
+			const extended = [String(supp.extended ?? ""), block].filter((x) => x.length > 0).join("\n\n");
+			const nextSupp = { ...supp, version: 1, batch, extended, items: supp.items };
+			writeSupplementFile(sessionId, nextSupp);
+
+			// 段：追加到 extended 槽 → 按槽位重拼整段（card_read 与面板读的就是这份）
+			const nextRecord = { ...record, slots: { ...record.slots, extended } };
+			nextRecord.text = renderSlotsText(nextRecord.slots);
+			nextRecord.chars = nextRecord.text.length;
+			nextRecord.supplement = { batch, pending: pendingItems(nextSupp).length };
+			sections.set(sessionId, nextRecord);
+			try {
+				writeSectionFile(sessionId, nextRecord.text);
+			} catch (error) {
+				log("补注入段落盘失败（不影响本次注入）", error?.message ?? error);
+			}
+
+			return {
+				ok: true,
+				batch,
+				added: take.map((x) => x.label),
+				addedChars: used,
+				totalChars: nextRecord.chars,
+				remainingItems: pendingItems(nextSupp).length,
+				remainingChars: pendingChars(nextSupp),
+				note: "已并入系统提示，从下一轮请求开始生效。需要更多设定就再调一次。",
+			};
 		},
 	};
 }
@@ -1280,20 +1587,47 @@ function toolRead(ctx) {
  * @param {string} fullPath 卡 ref；**传空串表示全局变量变了** → 所有会话都重建
  * @returns {Promise<string[]>} 被重建的 sessionId
  */
+/**
+ * 变量 / 面板开关改动后，把受影响的会话的注入段重建一遍。
+ *
+ * 为什么必须重建：注入段是**建段时**渲染好、写进宿主 systemPrompt 的，
+ * 之后每一轮都复用那份文本。只改 vars.json 或 settings.json 的话，当前会话在重新召唤之前
+ * 仍是旧值，面板会显得「改了没用」—— 用户最容易踩的坑，必须堵死。
+ *
+ * 遍历的是**召唤记录**而不是内存里的 sections：开关是全局的，连「刚重启、段还没恢复成功的
+ * 会话」也该跟上。全量重建（want === ""）下这是唯一能覆盖到全部会话的列表。
+ *
+ * @param {string} fullPath 卡 ref；**传空串表示全局项变了** → 所有会话都重建
+ * @returns {Promise<string[]>} 被重建的 sessionId
+ */
 async function rerenderSessionsFor(fullPath, cfg) {
 	const want = String(fullPath ?? "").trim();
 	const touched = [];
-	for (const [sessionId, section] of sections) {
-		// 阵容段没有单一 fullPath（它是多张卡的合成），跳过；否则会误伤。
-		if (typeof section?.fullPath !== "string") continue;
-		if (want.length > 0 && section.fullPath !== want) continue;
+	for (const [sessionId, record] of Object.entries(listSummons())) {
+		const fp = typeof record?.fullPath === "string" ? record.fullPath : "";
+		if (want.length > 0 && fp !== want) continue;
 		const card = loadCardFile(sessionId);
 		if (card === undefined) continue;
 		try {
-			await buildSection(sessionId, card, cfg);
+			// 阵容快照必须走阵容分支。全量重建（want === ""）以前会把它当单卡喂给
+			// composeSlots —— 见 castSectionOf 的注释，这也是开关要全量重建才暴露的老 bug。
+			if (card?.kind === "cast") {
+				const restored = castSectionOf(card, cfg);
+				sections.set(sessionId, restored);
+				try {
+					writeSectionFile(sessionId, restored.text);
+				} catch (error) {
+					log("阵容段落盘失败（不影响本次注入）", error?.message ?? error);
+				}
+				touched.push(sessionId);
+				continue;
+			}
+			// reseed:false —— 开关重建不是重新召唤：账本里的进度与已补注入的正文必须原样保留，
+			// 否则用户点一下面板，模型刚拿到的那批补充设定就又没了。
+			await buildSection(sessionId, card, cfg, { reseed: false });
 			touched.push(sessionId);
 		} catch (error) {
-			log(`变量改动后重建 ${sessionId} 注入段失败：${error?.message ?? error}`);
+			log(`重建 ${sessionId} 注入段失败：${error?.message ?? error}`);
 		}
 	}
 	return touched;
@@ -1339,6 +1673,9 @@ function makeHandler(ctx, cfg) {
 				// 动态世界书候选条目数（0 = 这张卡没有可被关键词触发的条目；null = 没传 sessionId）。
 				// 命中与否取决于本轮对话，这里只报「有多少条待撞」，让这个功能可观测。
 				dynamicEntries: sessionId === undefined ? null : (live?.dynSource?.lorebook?.entries?.length ?? 0),
+				// 虚构框架开关的生效态。跟 summon 一样是全局项 —— 面板 4 秒轮询一次它，
+				// 所以在别的标签页/会话里改了，这边会自动跟上。
+				fictionFrame: fictionFrameState(cfg),
 			};
 		};
 
@@ -1471,6 +1808,55 @@ function makeHandler(ctx, cfg) {
 					},
 					minorFlag: detectMinorFlag(card),
 				});
+			}
+
+			// 面板开关（运行时设置）。目前只有「虚构框架」一项，但端点按通用形状写：
+			//   GET  → 当前生效态（含 source：panel / config，面板据此显示「跟随配置」还是「手动」）
+			//   POST → 写入并**立刻全量重建注入段**，否则当前会话要重新召唤才跟上
+			//
+			// 为什么不复用 vars 端点：vars 是「卡里的宏填什么」，这是「插件行为开关」，
+			// 两者生命周期与作用域都不同（一个是 per-card，一个是全局）。
+			if (seg === "settings") {
+				if (req.method === "GET") {
+					return reply(res, 200, {
+						ok: true,
+						fictionFrame: fictionFrameState(cfg),
+						// 自定义文本原文回显：面板要能把它填回输入框（关掉开关也不丢）
+						fictionFrameText: (() => {
+							const opts = composeOpts(cfg);
+							return typeof opts.fictionFrameText === "string" ? opts.fictionFrameText : "";
+						})(),
+						maxFrameText: MAX_FRAME_TEXT,
+						file: settingsPath(),
+					});
+				}
+				if (req.method === "POST") {
+					const body = await readJsonBody(req);
+					if (body !== null && typeof body === "object" && "fictionFrame" in body) {
+						const v = body.fictionFrame;
+						// 只接受 true / false / null（null = 回到跟随配置）。
+						// 传别的值不回写，避免把面板的脏数据钉进盘。
+						if (v === true || v === false || v === null) await setFictionFrame(v);
+					}
+					if (body !== null && typeof body === "object" && "fictionFrameText" in body) {
+						await setFictionFrameText(body.fictionFrameText);
+					}
+					invalidateSettingsCache();
+					// 全量重建：开关是全局项，所有已召唤会话的注入段都变了
+					const touched = await rerenderSessionsFor("", cfg);
+					const state = fictionFrameState(cfg);
+					log(`虚构框架开关 → ${state.enabled ? "开" : "关"}（来源 ${state.source}），重建 ${touched.length} 个注入段`);
+					return reply(res, 200, {
+						ok: true,
+						fictionFrame: state,
+						fictionFrameText: (() => {
+							const opts = composeOpts(cfg);
+							return typeof opts.fictionFrameText === "string" ? opts.fictionFrameText : "";
+						})(),
+						touched,
+						file: settingsPath(),
+					});
+				}
 			}
 
 			// 取数来源偏好：面板的「本地磁盘 / GitHub」切换器读写它。
@@ -1907,48 +2293,14 @@ export async function apply(ctx, config) {
 	for (const [sessionId] of Object.entries(listSummons())) {
 		const diskText = loadSectionFromDisk(sessionId);
 		let restored;
+		let fromCard = false;
 		try {
 			const card = loadCardFile(sessionId);
 			if (card !== null && typeof card === "object") {
-				if (card.kind === "cast") {
-					const members = Array.isArray(card.members) ? card.members : [];
-					const composed = composeCast(members, {
-						writingStyle: cfg?.writingStyle,
-						writingStyleText: cfg?.writingStyleText,
-						fictionFrame: cfg?.fictionFrame,
-						fictionFrameText: cfg?.fictionFrameText,
-					});
-					restored = {
-						slots: { main: composed.text },
-						text: composed.text,
-						chars: composed.chars,
-						truncatedFields: composed.truncatedFields,
-						fullPath: members.map((m) => m?.card?.fullPath ?? "").join(","),
-						name: `阵容(${composed.cast.length}人)：${composed.cast.join("、")}`,
-						kind: "cast",
-						dynSource: mergeDynamicSources(members.map((m) => m?.card ?? m)),
-					};
-				} else {
-					const composed = composeSlots(card, {
-						maxPersonality: cfg?.maxPersonality,
-						writingStyle: cfg?.writingStyle,
-						writingStyleText: cfg?.writingStyleText,
-						fictionFrame: cfg?.fictionFrame,
-						fictionFrameText: cfg?.fictionFrameText,
-					});
-					restored = {
-						slots: composed.slots,
-						text: composed.text,
-						chars: composed.chars,
-						truncatedFields: composed.truncatedFields,
-						fullPath: card.fullPath,
-						// 动态世界书的候选条目是**内存态**（不随注入段文本落盘）—— 这里从卡快照现算，
-						// 否则重启后「之前召唤过的会话」会静默失去 keys 触发，而且 /status 的
-						// dynamicEntries 显示 0，与「这张卡压根没有候选条目」无法区分。
-						// 正文与静态段一致，走注入前转换。
-						dynSource: dynamicSourceOf(markdownizeCard(card)),
-					};
-				}
+				// 单卡与阵容同一条路径（sectionRecordOf 内部按 kind 分流），
+				// 运行时开关也由 composeOpts 统一叠加 —— 恢复出来的段与召唤时完全一致。
+				restored = sectionRecordOf(card, cfg);
+				fromCard = true;
 			}
 		} catch (error) {
 			log(`恢复 ${sessionId} 槽位失败，退回整段落盘`, error?.message ?? error);
@@ -1957,6 +2309,10 @@ export async function apply(ctx, config) {
 			if (diskText === undefined || diskText.length === 0) continue;
 			restored = { slots: { main: diskText }, text: diskText, chars: diskText.length, truncatedFields: [] };
 		}
+		// 账本叠回去：重启不能丢「已经补注入的正文」，也不能把未注入的碎片重复排队。
+		// ⚠️ 只在**从卡快照现算**时叠：退回落盘整段时，那份文本本身已经含补注入内容，
+		// 再叠一次就会重复（整段落被塞进 main 槽，extended 又来一遍）。
+		if (fromCard) restored = hydrateSupplement(sessionId, restored, { reseed: false });
 		sections.set(sessionId, { ...restored, at: new Date().toISOString() });
 	}
 
@@ -2000,18 +2356,48 @@ export async function apply(ctx, config) {
 						if (slot.key === "greeting") {
 							return hasAssistantMessage(context) ? "" : (hit.slots?.greeting ?? "");
 						}
-						// 世界书动态触发 + 静态 atDepth 条目合并在 lore 槽里，每轮重算。
+						// lore 槽只留静态 atDepth 条目。动态 keys 触发已搬到 user 角色的
+						// systemPrompt.context（见本文件 apply 尾部的 dynamic-lore），这里不再合并，
+						// 否则同一条目会在 system + user 里各出现一次。
 						// 这里**只能做纯内存字符串匹配** —— 求值器每轮都跑，任何 IO 都会拖慢整轮。
 						if (slot.key === "lore") {
-							const staticLore = hit.slots?.lore ?? "";
-							if (hit.dynSource === undefined) return staticLore;
-							const lore = composeDynamicLore(hit.dynSource, recentTextOf(context, DYNAMIC_SCAN_DEPTH)).text;
-							return [staticLore, lore].filter((x) => x.length > 0).join("\n");
+							return hit.slots?.lore ?? "";
 						}
 						return hit.slots?.[slot.key] ?? "";
 					},
 				}),
 			`dsh-card-summon: system prompt section ${slot.key}`,
+		);
+	}
+
+	// ── 动态世界书：user 角色的 context，不是 system ──
+	// 酒馆里 keys 触发的条目是按深度插进历史附近的（@D / after history），role 可配；
+	// DSH 里最接近的正道就是 systemPrompt.context：宿主把它拼成一条 user 消息
+	//（packages/core/system-prompt/src/index.ts:78 注释原话 durable user-role snapshot，
+	// agent-loop 每步 append('user/message')，见 packages/core/agent-loop/src/agent.ts:457-470）。
+	// 静态人设继续走上面的 section（system），动态补充走这里（user），两边不再重叠。
+	// required:true：运行时上下文被 suppress 时动态设定也得留着，否则角色会失忆。
+	// 兼容旧测试假 ctx（只有 section 没有 context）：真机宿主恒有 context，缺失只在离线探针里出现。
+	if (typeof ctx.systemPrompt.context !== "function") {
+		log("宿主缺 systemPrompt.context（旧假 ctx），动态 lore 暂无 user 通道，本轮只注静态段");
+	} else {
+		ctx.effect(
+			() =>
+				ctx.systemPrompt.context({
+				name: DYNAMIC_LORE_CONTEXT_NAME,
+				order: DYNAMIC_LORE_CONTEXT_ORDER,
+				interpolate: false,
+				required: true,
+				text: (context) => {
+					const sessionId = sessionIdOf(context);
+					if (sessionId === undefined) return "";
+					const hit = sections.get(sessionId);
+					if (hit === undefined || hit.dynSource === undefined) return "";
+					// 纯内存字符串匹配，与旧 lore 槽同一口径。
+					return composeDynamicLore(hit.dynSource, recentTextOf(context, DYNAMIC_SCAN_DEPTH)).text;
+				},
+				}),
+			"dsh-card-summon: dynamic lore context (user role)",
 		);
 	}
 
@@ -2024,6 +2410,7 @@ export async function apply(ctx, config) {
 		toolUnsummon(ctx),
 		toolStatus(ctx),
 		toolRead(ctx),
+		toolInjectMore(ctx), // 分批补注入：只回执，正文走注入段
 	];
 	for (const tool of builtTools) {
 		ctx.effect(() => ctx.tools.register(tool), `dsh-card-summon: tool ${tool.name}`);
@@ -2036,7 +2423,7 @@ export async function apply(ctx, config) {
 	);
 
 	log(
-		`host half mounted｜注入段 ${SLOTS.length} 槽（main=${SECTION_ORDER} → ${SLOTS[SLOTS.length - 1].key}=${SLOTS[SLOTS.length - 1].order}，酒馆式顺序）｜` +
+		`host half mounted｜注入段 ${SLOTS.length} 槽（main=${SECTION_ORDER} → ${SLOTS[SLOTS.length - 1].key}=${SLOTS[SLOTS.length - 1].order}，酒馆式顺序）＋动态 context（${DYNAMIC_LORE_CONTEXT_NAME} order=${DYNAMIC_LORE_CONTEXT_ORDER}，user 角色）｜` +
 			`路由 ${ROUTE}/search｜状态 ${STATE_ROOT}｜恢复 ${sections.size} 个注入段`,
 	);
 }

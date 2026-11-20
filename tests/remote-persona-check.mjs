@@ -47,7 +47,7 @@ if (token.length === 0) {
 	process.exit(0);
 }
 
-const calls = { sections: [], tools: [], routes: [], effects: 0 };
+const calls = { sections: [], contexts: [], tools: [], routes: [], effects: 0 };
 const SESSION = "probe-remote-persona";
 const ctx = {
 	effect(fn) {
@@ -63,6 +63,10 @@ const ctx = {
 			calls.sections.push(def);
 			return () => {};
 		},
+		context(def) {
+			calls.contexts.push(def);
+				return () => {};
+			},
 	},
 	tools: {
 		register(def) {

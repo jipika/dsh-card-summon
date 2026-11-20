@@ -9,9 +9,16 @@
  * 需要网络（search / summon 会真的打 Chub）。
  */
 import { EventEmitter } from "node:events";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+// 状态隔离：本探针会真的召唤/解除，不隔离就会把记录写进 ~/.dsh/card-summon，
+// 下次跑时「未召唤 → summon 为 null」先失败（实测踩过），还会污染用户真实状态。
+process.env.DSH_CARD_SUMMON_STATE ??= mkdtempSync(join(tmpdir(), "card-summon-probe-"));
 
 const Emitter = EventEmitter;
-const calls = { sections: [], tools: [], routes: [], effects: 0 };
+const calls = { sections: [], contexts: [], tools: [], routes: [], effects: 0 };
 const disposers = [];
 
 let pass = 0;
@@ -41,6 +48,10 @@ const ctx = {
 	systemPrompt: {
 		section(def) {
 			calls.sections.push(def);
+			return () => {};
+		},
+		context(def) {
+			calls.contexts.push(def);
 			return () => {};
 		},
 	},
@@ -80,7 +91,15 @@ t(
 	calls.sections.length === mod.SLOTS.length,
 	`实得 ${calls.sections.length}`,
 );
-t("工具注册 7 个（含 card_cast 阵容 + card_local_scan）", calls.tools.length === 7, `实得 ${calls.tools.length}`);
+t("systemPrompt.context 注册 1 条动态 lore（user 角色）", calls.contexts.length === 1, `实得 ${calls.contexts.length}`);
+t(
+	"动态 context 名与 order 正确",
+	calls.contexts[0]?.name === mod.DYNAMIC_LORE_CONTEXT_NAME && calls.contexts[0]?.order === mod.DYNAMIC_LORE_CONTEXT_ORDER,
+	`实得 ${calls.contexts[0]?.name}@${calls.contexts[0]?.order}`,
+);
+t("动态 context 关插值且 required（运行时 suppress 也不丢设定）", calls.contexts[0]?.interpolate === false && calls.contexts[0]?.required === true);
+t("动态 context.text 是函数（每步求值）", typeof calls.contexts[0]?.text === "function");
+t("工具注册 8 个（含 card_cast 阵容 + card_local_scan + card_inject_more 分批补注入）", calls.tools.length === 8, `实得 ${calls.tools.length}`);
 t("webServer 路由注册 1 条", calls.routes.length === 1, `实得 ${calls.routes.length}`);
 
 const section = calls.sections[0];
@@ -118,6 +137,12 @@ const before = evalFor("never-summoned-session");
 t("未召唤 → 空串（不注入）", before === "", `实得长度 ${before.length}`);
 t("context 缺失 → 空串", section.text(undefined) === "");
 t("会话 id 缺失 → 空串", evalFor(undefined) === "");
+const dynEvalFor = (sessionId, text = "") =>
+	calls.contexts[0].text({
+		agent: { sessionId, session: { header: { id: sessionId }, deriveMessages: () => (text ? [{ content: [{ type: "text", text }] }] : []) } },
+	});
+t("未召唤时动态 context 也是空串（user 侧零残留）", dynEvalFor("never-summoned-session", "血月") === "");
+t("动态 context 缺失 assembled context → 空串", calls.contexts[0].text(undefined) === "");
 
 /* ───────────────── 路由端到端 ───────────────── */
 function fakeReq(method, url, body) {
@@ -207,12 +232,22 @@ if (target === undefined) {
 
 	const other = evalFor("some-other-session");
 	t("**别的会话仍为空串**（隔离）", other === "", `实得长度 ${other.length}`);
+	t("别的会话动态 context 也是空串", dynEvalFor("some-other-session", "血月") === "");
+	// 动态 context 求值器必须可调用且返回字符串（有无命中取决于卡的 keys，这里只钉类型与隔离性）
+	t("已召唤时动态 context 可求值（字符串）", typeof dynEvalFor(SESSION, "今天天气不错") === "string");
 
-	// card_read 能取回完整卡
+	// card_read：有召唤时只回注入段（2026-11-03 边界收口，原卡不再可读）
 	const readTool = calls.tools.find((x) => x.name === "card_read");
-	const readOut = await readTool.execute({ field: "personality" }, {});
-	t("card_read 能取回 personality", readOut.text.length > 0, JSON.stringify(readOut).slice(0, 120));
-	t("card_read 报原始长度", Number(readOut.original) > 0);
+	const readOut = await readTool.execute({}, {});
+	t("card_read 回注入段（mode=injected）", readOut.mode === "injected", JSON.stringify(readOut).slice(0, 120));
+	t("注入段非空且带长度", readOut.text.length > 0 && Number(readOut.chars) > 0);
+	let legacyErr = null;
+	try {
+		await readTool.execute({ field: "lorebook" }, {});
+	} catch (error) {
+		legacyErr = error;
+	}
+	t("按字段读原卡被拒（只给注入段）", legacyErr !== null);
 
 	const statusNow = await call("GET", "/dsh-card-summon/status?sessionId=" + SESSION);
 	t("status 反映已召唤", statusNow.json.summon !== null && statusNow.json.injected > 0);
@@ -230,6 +265,7 @@ if (target === undefined) {
 	const afterUnsummon = evalFor(SESSION);
 	console.log(`  求值器（已解除）→ 长度 ${afterUnsummon.length}`);
 	t("**解除后回到空串**（零残留）", afterUnsummon === "", `实得长度 ${afterUnsummon.length}`);
+	t("解除后动态 context 回到空串（user 侧零残留）", dynEvalFor(SESSION, "血月") === "");
 }
 
 console.log("\n=== 8) output.render 契约（7 工具同源故障的回归闸）===");

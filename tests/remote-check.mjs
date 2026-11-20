@@ -23,7 +23,7 @@ const calls = { routes: [], tools: {} };
 const ctx = {
   effect: (f) => { const d = f(); return typeof d === "function" ? d : () => {}; },
   on: () => () => {},
-  systemPrompt: { section: () => () => {} },
+  systemPrompt: { context: () => () => {}, section: () => () => {} },
   tools: { register: (d) => { calls.tools[d.name] = d; return () => {}; } },
   webServer: { register: (d) => { calls.routes.push(d); return () => {}; } },
   agents: { currentInitiator: () => ({ sessionId: "r1", session: { header: { id: "r1" } } }) },
@@ -81,6 +81,9 @@ if (r.ok) {
 }
 
 console.log("\n=== ⑤ card_read 也能走远程 ===");
+// 有召唤的会话只能读注入段（2026-11-03 边界收口）。这里验的是「远程取卡」这条路，
+// 所以先解除召唤，回到无召唤状态再读原文 —— 那才是 fullPath 原读的合法场景。
+await calls.tools.card_unsummon.execute({}, {});
 try {
   const r2 = await calls.tools.card_read.execute({ fullPath: `local://${withMonth.rel}`, field: "personality", maxChars: 100 }, {});
   t("card_read 远程可用", typeof r2.text === "string", JSON.stringify(r2).slice(0,80));

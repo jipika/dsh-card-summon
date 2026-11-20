@@ -6,7 +6,7 @@ const ROOT = new URL("..", import.meta.url).pathname.replace(/\/$/, "");
  * 取数来源切换（本地磁盘 / GitHub）验证。
  *
  * 两侧是**同一批 11480 张卡**（实测 rel 集合完全相同），只是取数路径不同。
- * 默认 remote —— 用户明确要求「都连到远程」。
+ * 默认 local —— 用户要求默认走本地磁盘。
  * 覆盖：默认值 / 双向切换 / 非法值拒绝 / search 参数临时切换 / 缩略图缓存读写。
  */
 const LIB = process.env.CARD_LIB_ROOT ?? "/Volumes/mac/下载/26.6角色卡/26.7月全中文备注角色卡（14000➕）";
@@ -17,7 +17,7 @@ if (!existsSync(LIB)) {
 const calls = { routes: [], tools: {} };
 const ctx = {
   effect: (f) => { const d = f(); return typeof d === "function" ? d : () => {}; },
-  on: () => () => {}, systemPrompt: { section: () => () => {} },
+  on: () => () => {}, systemPrompt: { context: () => () => {}, section: () => () => {} },
   tools: { register: (d) => { calls.tools[d.name] = d; return () => {}; } },
   webServer: { register: (d) => { calls.routes.push(d); return () => {}; } },
   agents: { currentInitiator: () => ({ sessionId: "o", session: { header: { id: "o" } } }) },
@@ -42,7 +42,7 @@ const t = (l, c, e = "") => { if (c) { pass++; console.log(`  ✓ ${l}`); } else
 console.log("=== ① 默认来源 ===");
 const o1 = await call("/dsh-card-summon/origin");
 console.log(`  origin=${o1.origin} remoteEnabled=${o1.remoteEnabled} localConfigured=${o1.localConfigured}`);
-t("默认是 remote（用户要求「都连到远程」）", o1.origin === "remote", `实得 ${o1.origin}`);
+t("默认是 local（默认走本地磁盘）", o1.origin === "local", `实得 ${o1.origin}`);
 t("汇报了 thumbs 统计", o1.thumbs !== undefined);
 
 console.log("\n=== ② 切到 local ===");
